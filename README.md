@@ -51,7 +51,7 @@ pip install openai numpy scipy rdkit
 ## Installation
 
 ```bash
-git clone <your-repo-url>
+git clone <git clone https://github.com/mustafajaved745-source/AI-Guided-Docking-Protocol-AGDP-.git>
 cd agdp
 pip install openai numpy scipy rdkit
 ```
