@@ -185,3 +185,9 @@ docking_results/
 ## License
 
 GNU Affero General Public License v3.0 — see `LICENSE` for details.
+
+## Commercial License
+
+The software in this repository is available under the AGPL v3 license for open-source and academic use.
+
+For commercial use — see `COMMERCIAL` for details.
