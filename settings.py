@@ -1,5 +1,5 @@
 """
-AI-Guided Molecular Docking Pipeline
+Molecular Docking Pipeline
 =====================================
 settings.py — Settings dialog + config persistence
 
@@ -13,7 +13,15 @@ import json
 import os
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+try:
+    import ttkbootstrap as ttkb
+
+    _HAS_TTKB = True
+except ImportError:  # graceful fallback when ttkbootstrap isn't installed
+    ttkb = None  # type: ignore[assignment]
+    _HAS_TTKB = False
 
 # ════════════════════════════════════════════════════════════════════════════
 #  Config file location (same folder as this script)
@@ -27,15 +35,10 @@ DEFAULT_CONFIG: dict = {
     "pymol_exe": "",  # PyMOL binary (used with -c flag)
     "mk_prepare_ligand_cmd": "",  # mk_prepare_ligand script/executable
     "mk_prepare_receptor_cmd": "",  # mk_prepare_receptor script/executable
-    # ── AI / API ─────────────────────────────────────────────────────────
-    "api_key": "",
-    "api_provider": "openrouter",  # openrouter | openai | nvidia | custom
-    "api_base_url": "https://openrouter.ai/api/v1",
-    "model": "meta-llama/llama-3.1-70b-instruct",
     # ── Output ───────────────────────────────────────────────────────────
     "output_dir": str(Path.home() / "docking_results"),
     # ── Docking parameters ───────────────────────────────────────────────
-    "grid_padding": 6.0,  # Docking box padding in Angstroms
+    "grid_padding": 4.0,  # Docking box padding in Angstroms
     "exhaustiveness": 8,
     "num_modes": 9,
     "cpu": 0,  # 0 = Vina auto-detects
@@ -47,27 +50,44 @@ DEFAULT_CONFIG: dict = {
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def load_config() -> dict:
-    """Load config.json and merge with DEFAULT_CONFIG so new keys are always present.
+def _profile_path(name: str = "default") -> Path:
+    """Path of a named config profile. "default" → config.json, else config_<name>.json."""
+    if not name or name == "default":
+        return CONFIG_FILE
+    return CONFIG_FILE.with_name(f"config_{name}.json")
 
-    Creates config.json with defaults if it does not yet exist.
+
+def list_profiles() -> list[str]:
+    """Names of all config profiles present next to config.json ("default" first)."""
+    profiles = ["default"]
+    if CONFIG_FILE.parent.exists():
+        for p in sorted(CONFIG_FILE.parent.glob("config_*.json")):
+            profiles.append(p.name[len("config_") : -len(".json")])
+    return profiles
+
+
+def load_config(name: str = "default") -> dict:
+    """Load a named profile and merge with DEFAULT_CONFIG so new keys are always present.
+
+    Creates the profile file with defaults if it does not yet exist.
     """
     merged = DEFAULT_CONFIG.copy()
-    if CONFIG_FILE.exists():
+    path = _profile_path(name)
+    if path.exists():
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 stored = json.load(f)
             merged.update(stored)
         except (json.JSONDecodeError, OSError):
             pass
     else:
-        _write_json(merged)
+        _write_json(merged, path)
     return merged
 
 
-def save_config(config: dict) -> None:
-    """Persist config dict to config.json."""
-    _write_json(config)
+def save_config(config: dict, name: str = "default") -> None:
+    """Persist config dict to the given profile file."""
+    _write_json(config, _profile_path(name))
 
 
 def validate_config(config: dict) -> list[str]:
@@ -91,9 +111,8 @@ def validate_config(config: dict) -> list[str]:
         elif not Path(val).exists():
             errors.append(f"{label} not found at: {val}")
 
-    # API key
-    if not str(config.get("api_key", "")).strip():
-        errors.append("API key is not set.")
+    # API key is optional — active-site selection is now done manually in the
+    # GUI and requires no network calls.
 
     # Output directory
     out = str(config.get("output_dir", "")).strip()
@@ -115,15 +134,21 @@ def validate_config(config: dict) -> list[str]:
 class SettingsDialog:
     """Modal Toplevel settings GUI dialog."""
 
-    def __init__(self, parent: tk.Tk, config: dict):
+    def __init__(
+        self,
+        parent: tk.Tk,
+        config: dict,
+        style=None,
+        profile: str = "default",
+    ):
         self._config = config.copy()
         self._vars: dict = {}
-        self._api_entry: ttk.Entry | None = None
-        self._model_combo: ttk.Combobox | None = None
-        self._or_status_var: tk.StringVar | None = None
+        self._style = style
+        self._profile = profile
+        self.saved_profile = profile
 
         dlg = tk.Toplevel(parent)
-        dlg.title("Settings — AI GUIDED DOCKING PROTOCOL (AGDP)")
+        dlg.title("Settings — Molecular Docking Pipeline")
         dlg.geometry("740x580")
         dlg.resizable(True, False)
         dlg.transient(parent)
@@ -135,42 +160,46 @@ class SettingsDialog:
         dlg.wait_window()
 
     def _setup_styles(self):
-        s = ttk.Style()
-        bg = "#f5f6fa"
+        if self._style is None:
+            self._style = ttkb.Style(theme="darkly") if _HAS_TTKB else ttk.Style()
+        s = self._style
+        colors = getattr(s, "colors", None)
+        bg = getattr(colors, "bg", "#f5f6fa")
+        fg = getattr(colors, "fg", "#000000")
+        hint = getattr(colors, "secondary", "#7f8c8d")
         s.configure("Dialog.TFrame", background=bg)
         s.configure("Dialog.TLabelframe", background=bg)
         s.configure(
             "Dialog.TLabelframe.Label",
             font=("Segoe UI", 9, "bold"),
             background=bg,
+            foreground=fg,
         )
         s.configure(
             "Hint.TLabel",
-            foreground="#7f8c8d",
+            foreground=hint,
             font=("Segoe UI", 8),
             background=bg,
         )
         s.configure(
-            "Link.TLabel",
-            foreground="#2980b9",
-            font=("Segoe UI", 8),
+            "SectionHead.TLabel",
+            font=("Segoe UI", 9, "bold"),
             background=bg,
-            cursor="hand2",
-        )
-        s.configure(
-            "SectionHead.TLabel", font=("Segoe UI", 9, "bold"), background=bg
+            foreground=fg,
         )
 
     def _build(self, dlg: tk.Toplevel):
-        dlg.configure(bg="#f5f6fa")
+        colors = getattr(self._style, "colors", None)
+        dlg.configure(bg=getattr(colors, "bg", "#f5f6fa"))
         outer = ttk.Frame(dlg, padding="14", style="Dialog.TFrame")
         outer.pack(fill=tk.BOTH, expand=True)
+
+        self._build_profile_row(outer)
 
         nb = ttk.Notebook(outer)
         nb.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
 
         self._tab_executables(nb)
-        self._tab_api(nb)
         self._tab_docking(nb)
 
         sep = ttk.Separator(outer, orient=tk.HORIZONTAL)
@@ -198,25 +227,25 @@ class SettingsDialog:
             (
                 "AutoDock Vina:",
                 "vina_exe",
-                "The vina binary. e.g. /usr/local/bin/vina",
+                "The vina binary. e.g. /usr/local/bin/vina or C:\\Program Files\\AutoDock Vina\\vina.exe",
                 "file",
             ),
             (
                 "PyMOL:",
                 "pymol_exe",
-                "PyMOL binary called with -c flag. e.g. /usr/bin/pymol",
+                "PyMOL binary (headless mode). e.g. /usr/bin/pymol or C:\\Program Files\\PyMOL\\PyMOLWin.exe",
                 "file",
             ),
             (
                 "mk_prepare_ligand:",
                 "mk_prepare_ligand_cmd",
-                "Meeko ligand prep script or executable.",
+                "Meeko ligand prep script or executable. e.g. mk_prepare_ligand (on PATH) or mk_prepare_ligand.py",
                 "file",
             ),
             (
                 "mk_prepare_receptor:",
                 "mk_prepare_receptor_cmd",
-                "Meeko receptor prep script or executable.",
+                "Meeko receptor prep script or executable. e.g. mk_prepare_receptor (on PATH)",
                 "file",
             ),
             (
@@ -268,157 +297,6 @@ class SettingsDialog:
                 row=base_row + 2, column=0
             )
 
-    # ── Tab 2 — AI / API ────────────────────────────────────────────────────
-
-    def _tab_api(self, nb: ttk.Notebook):
-        frame = ttk.Frame(nb, padding="12", style="Dialog.TFrame")
-        nb.add(frame, text=" AI / API ")
-        frame.columnconfigure(1, weight=1)
-
-        ttk.Label(frame, text="Provider:", style="SectionHead.TLabel").grid(
-            row=0, column=0, sticky=tk.W, padx=(0, 10), pady=(8, 0)
-        )
-
-        PROVIDERS = {
-            "OpenRouter": (
-                "https://openrouter.ai/api/v1",
-                "meta-llama/llama-3.1-70b-instruct",
-            ),
-            "OpenAI": ("https://api.openai.com/v1", "gpt-4o-mini"),
-            "NVIDIA AI": (
-                "https://integrate.api.nvidia.com/v1",
-                "meta/llama-3.1-70b-instruct",
-            ),
-            "Custom": ("", ""),
-        }
-
-        stored_provider = (
-            str(self._config.get("api_provider", "openrouter")).lower().strip()
-        )
-        label_map = {
-            "openrouter": "OpenRouter",
-            "openai": "OpenAI",
-            "nvidia": "NVIDIA AI",
-            "custom": "Custom",
-        }
-
-        provider_var = tk.StringVar(
-            value=label_map.get(stored_provider, "OpenRouter")
-        )
-        self._vars["api_provider"] = provider_var
-
-        provider_combo = ttk.Combobox(
-            frame,
-            textvariable=provider_var,
-            state="readonly",
-            values=list(PROVIDERS.keys()),
-            width=20,
-        )
-        provider_combo.grid(row=0, column=1, sticky=tk.W, pady=(8, 0))
-
-        # API Key
-        ttk.Label(frame, text="API Key:", style="SectionHead.TLabel").grid(
-            row=1, column=0, sticky=tk.W, padx=(0, 10), pady=(8, 0)
-        )
-
-        api_var = tk.StringVar(value=str(self._config.get("api_key", "")))
-        self._vars["api_key"] = api_var
-
-        self._api_entry = ttk.Entry(frame, textvariable=api_var, show="*")
-        self._api_entry.grid(
-            row=1, column=1, sticky=tk.EW, padx=(0, 6), pady=(8, 0)
-        )
-
-        ttk.Button(
-            frame, text="👁", width=3, command=self._toggle_api_visibility
-        ).grid(row=1, column=2, pady=(8, 0))
-
-        # Base URL
-        ttk.Label(frame, text="Base URL:", style="SectionHead.TLabel").grid(
-            row=2, column=0, sticky=tk.W, padx=(0, 10), pady=(6, 0)
-        )
-
-        base_url_var = tk.StringVar(
-            value=str(
-                self._config.get(
-                    "api_base_url", "https://openrouter.ai/api/v1"
-                )
-            )
-        )
-        self._vars["api_base_url"] = base_url_var
-
-        ttk.Entry(frame, textvariable=base_url_var).grid(
-            row=2, column=1, columnspan=2, sticky=tk.EW, pady=(6, 0)
-        )
-
-        # Model
-        ttk.Label(frame, text="Model:", style="SectionHead.TLabel").grid(
-            row=3, column=0, sticky=tk.W, padx=(0, 10), pady=(6, 0)
-        )
-
-        model_var = tk.StringVar(value=str(self._config.get("model", "")))
-        self._vars["model"] = model_var
-
-        self._model_combo = ttk.Combobox(
-            frame, textvariable=model_var, width=48
-        )
-        self._model_combo.grid(row=3, column=1, sticky=tk.EW, pady=(6, 0))
-
-        ttk.Button(
-            frame,
-            text="⟳ Fetch",
-            width=8,
-            command=lambda: self._fetch_or_models(
-                api_var, base_url_var, model_var
-            ),
-        ).grid(row=3, column=2, pady=(6, 0))
-
-        self._or_status_var = tk.StringVar(value="")
-        ttk.Label(
-            frame, textvariable=self._or_status_var, style="Hint.TLabel"
-        ).grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
-
-        hints = {
-            "OpenRouter": (
-                "→ openrouter.ai — free and paid model access",
-                "https://openrouter.ai/keys",
-            ),
-            "OpenAI": (
-                "→ platform.openai.com/api-keys",
-                "https://platform.openai.com/api-keys",
-            ),
-            "NVIDIA AI": (
-                "→ build.nvidia.com/explore/discover",
-                "https://build.nvidia.com/explore/discover",
-            ),
-            "Custom": ("Enter any OpenAI-compatible base URL above.", ""),
-        }
-
-        link_text_var = tk.StringVar()
-        link_label = ttk.Label(
-            frame, textvariable=link_text_var, style="Link.TLabel"
-        )
-        link_label.grid(
-            row=5, column=0, columnspan=3, sticky=tk.W, pady=(6, 0)
-        )
-        self._link_url = ""
-
-        def _on_provider_change(*_):
-            label = provider_var.get()
-            info = PROVIDERS.get(label, ("", ""))
-            base_url_var.set(info[0])
-            if not model_var.get():
-                model_var.set(info[1])
-            hint, url = hints.get(label, ("", ""))
-            link_text_var.set(hint)
-            self._link_url = url
-
-        provider_combo.bind("<<ComboboxSelected>>", _on_provider_change)
-        link_label.bind("<Button-1>", lambda _: _open_url(self._link_url))
-
-        _on_provider_change()
-        model_var.set(str(self._config.get("model", model_var.get())))
-
     # ── Tab 3 — Docking Parameters ──────────────────────────────────────────
 
     def _tab_docking(self, nb: ttk.Notebook):
@@ -432,12 +310,12 @@ class SettingsDialog:
             (
                 "Grid Padding (Å):",
                 "grid_padding",
-                float(self._config.get("grid_padding", 6.0)),
+                float(self._config.get("grid_padding", 4.0)),
                 3.0,
                 12.0,
                 0.5,
                 "float",
-                "Distance added to each side of the native ligand bounding box (default 6.0 Å).",
+                "Distance added to each side of the native ligand bounding box (default 4.0 Å).",
             ),
             (
                 "Exhaustiveness:",
@@ -528,6 +406,75 @@ class SettingsDialog:
             frame, text=notes, style="Hint.TLabel", justify=tk.LEFT
         ).grid(row=row_offset + 1, column=0, columnspan=3, sticky=tk.W)
 
+    # ── Profile helpers ─────────────────────────────────────────────────────
+
+    def _build_profile_row(self, outer: ttk.Frame) -> None:
+        row = ttk.Frame(outer, style="Dialog.TFrame")
+        row.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(row, text="Profile:", style="SectionHead.TLabel").pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        self._profile_var = tk.StringVar(value=self._profile)
+        self._profile_combo = ttk.Combobox(
+            row,
+            textvariable=self._profile_var,
+            values=list_profiles(),
+            state="readonly",
+            width=26,
+        )
+        self._profile_combo.pack(side=tk.LEFT)
+        self._profile_combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
+
+        ttk.Button(
+            row, text="New…", width=8, command=self._new_profile
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        ttk.Label(
+            row,
+            text="Save writes to the selected profile file.",
+            style="Hint.TLabel",
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+    def _on_profile_selected(self, _event=None) -> None:
+        name = self._profile_var.get()
+        if not name or name == self._profile:
+            return
+        self._profile = name
+        self._config = load_config(name)
+        self._populate()
+
+    def _new_profile(self) -> None:
+        name = simpledialog.askstring(
+            "New Profile", "Profile name:", parent=self._dlg
+        )
+        if not name:
+            return
+        name = "".join(c for c in name.strip() if c.isalnum() or c in "-_ ").strip()
+        if not name:
+            return
+        if name in list_profiles():
+            messagebox.showwarning(
+                "Profile Exists",
+                f"Profile '{name}' already exists.",
+                parent=self._dlg,
+            )
+            return
+        self._profile = name
+        self._config = load_config(name)  # creates config_<name>.json with defaults
+        self._profile_var.set(name)
+        self._profile_combo["values"] = list_profiles()
+        self._populate()
+
+    def _populate(self) -> None:
+        """Refresh all bound vars from self._config (used when switching profiles)."""
+        for key, var in self._vars.items():
+            val = self._config.get(key, DEFAULT_CONFIG.get(key, ""))
+            try:
+                var.set(val)
+            except tk.TclError:
+                pass
+
     # ── Internal Helpers ────────────────────────────────────────────────────
 
     def _browse_file(self, var: tk.StringVar):
@@ -538,7 +485,7 @@ class SettingsDialog:
             initialdir=initial,
             filetypes=[
                 ("All files", "*"),
-                ("Executable / Script", "*.py *.sh *.bat"),
+                ("Executable / Script", "*.exe *.py *.bat *.cmd *.sh"),
             ],
         )
         if path:
@@ -551,56 +498,6 @@ class SettingsDialog:
         )
         if path:
             var.set(path)
-
-    def _toggle_api_visibility(self):
-        if self._api_entry is None:
-            return
-        currently_hidden = self._api_entry.cget("show") == "*"
-        self._api_entry.configure(show="" if currently_hidden else "*")
-
-    def _fetch_or_models(self, api_var, base_url_var, model_var):
-        import json as _json
-        import threading
-        import urllib.request
-
-        base = base_url_var.get().rstrip("/")
-        key = api_var.get().strip()
-        if not base:
-            self._or_status_var.set("No base URL set.")
-            return
-        self._or_status_var.set("Fetching models…")
-
-        def _fetch():
-            try:
-                req = urllib.request.Request(
-                    f"{base}/models",
-                    headers={
-                        "Authorization": f"Bearer {key}",
-                        "Content-Type": "application/json",
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    data = _json.loads(r.read())
-                ids = sorted(
-                    m.get("id", "") for m in data.get("data", []) if m.get("id")
-                )
-
-                def _apply():
-                    if ids:
-                        self._model_combo["values"] = ids
-                        if model_var.get() not in ids:
-                            model_var.set(ids[0])
-                        self._or_status_var.set(f"{len(ids)} models loaded.")
-                    else:
-                        self._or_status_var.set("No models returned.")
-
-                self._dlg.after(0, _apply)
-            except Exception as e:
-                self._dlg.after(
-                    0, lambda: self._or_status_var.set(f"Fetch failed: {e}")
-                )
-
-        threading.Thread(target=_fetch, daemon=True).start()
 
     def _validate_and_report(self):
         tmp = self._collect_values()
@@ -628,17 +525,6 @@ class SettingsDialog:
             except tk.TclError:
                 result[key] = DEFAULT_CONFIG.get(key, "")
 
-        label_to_key = {
-            "OpenRouter": "openrouter",
-            "OpenAI": "openai",
-            "NVIDIA AI": "nvidia",
-            "Custom": "custom",
-        }
-        if "api_provider" in result:
-            result["api_provider"] = label_to_key.get(
-                result["api_provider"], str(result["api_provider"]).lower()
-            )
-
         return result
 
     def _save(self):
@@ -652,12 +538,13 @@ class SettingsDialog:
                 new_cfg[key] = DEFAULT_CONFIG[key]
 
         try:
-            new_cfg["grid_padding"] = float(new_cfg.get("grid_padding", 6.0))
+            new_cfg["grid_padding"] = float(new_cfg.get("grid_padding", 4.0))
         except (ValueError, TypeError):
             new_cfg["grid_padding"] = DEFAULT_CONFIG["grid_padding"]
 
-        save_config(new_cfg)
+        save_config(new_cfg, self._profile)
         self._config.update(new_cfg)
+        self.saved_profile = self._profile
         self._dlg.destroy()
 
 
@@ -666,14 +553,15 @@ class SettingsDialog:
 # ════════════════════════════════════════════════════════════════════════════
 
 
-def _write_json(data: dict) -> None:
-    """Atomically write config.json."""
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG_FILE.with_suffix(".tmp")
+def _write_json(data: dict, path: Path | None = None) -> None:
+    """Atomically write a config file."""
+    path = path or CONFIG_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        tmp.replace(CONFIG_FILE)
+        tmp.replace(path)
     except OSError:
         tmp.unlink(missing_ok=True)
         raise
@@ -688,11 +576,3 @@ def _initial_dir(current_val: str) -> str:
     return str(Path.home())
 
 
-def _open_url(url: str) -> None:
-    import webbrowser
-
-    if url:
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass

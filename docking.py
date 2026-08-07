@@ -1,5 +1,5 @@
 """
-AI-Guided Molecular Docking Pipeline
+Molecular Docking Pipeline
 =====================================
 docking.py — AutoDock Vina execution, RMSD validation, summary report
 
@@ -18,11 +18,11 @@ Public API
                    prefix, vina_exe, exhaustiveness, num_modes, cpu, log_cb)
       -> dict  {best_score, all_scores, output_pdbqt}
 
-  calculate_redock_rmsd(native_ligand_pdb, redocked_pdbqt)
+  calculate_redock_rmsd(native_coords, redocked_pdbqt)
       -> float  (Angstroms; 999.0 on failure)
 
   generate_summary_report(output_dir, receptor_file, ligand_files,
-                           active_site_code, ai_reason, grid,
+                           active_site_code, selection_reason, grid,
                            redock_rmsd, redock_score, docking_results)
       -> Path  (report file)
 """
@@ -125,7 +125,9 @@ def run_vina_docking(
     except FileNotFoundError:
         raise RuntimeError(
             f"AutoDock Vina executable not found at: {vina_exe}\n"
-            "Check the path in Settings."
+            "Checked PATH and common locations (conda, /usr/bin, /usr/local/bin).\n"
+            "Install: conda install -c conda-forge autoDock-vina\n"
+            "Then set the path in Settings (⚙)."
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(
@@ -176,18 +178,21 @@ def run_vina_docking(
 # ════════════════════════════════════════════════════════════════════════════
 
 def calculate_redock_rmsd(
-    native_ligand_pdb: Path,
-    redocked_pdbqt:    Path,
+    native_coords: List[Tuple[float, float, float]],
+    redocked_pdbqt: Path,
 ) -> float:
     """
     Calculate the RMSD between the crystal-pose native ligand and the
     top-ranked redocked pose. Heavy atoms only.
 
+    ``native_coords`` are the native ligand's crystal heavy-atom
+    coordinates (from receptor_prep.extract_native_ligand_coords), so no
+    ligand file needs to be created from the receptor.
+
     Returns 999.0 if the calculation fails for any reason (missing file,
     parse error, atom count mismatch).
     """
     try:
-        native_coords = _parse_pdb_heavy_coords(Path(native_ligand_pdb))
         docked_coords = _parse_pdbqt_model1_heavy_coords(Path(redocked_pdbqt))
 
         if not native_coords or not docked_coords:
@@ -208,11 +213,13 @@ def generate_summary_report(
     receptor_file:   str,
     ligand_files:    List[str],
     active_site_code: str,
-    ai_reason:       str,
-    grid:            Dict[str, float],
-    redock_rmsd:     float,
-    redock_score:    float,
-    docking_results: List[Dict],
+    target_chain:    str = "A",
+    selection_reason: str = "",
+    grid:            Dict[str, float] = None,
+    redock_rmsd:     Optional[float] = None,
+    redock_score:    float = 0.0,
+    docking_results: List[Dict] = None,
+    grid_padding:    float = 8.0,
 ) -> Path:
     """
     Write a plain-text summary report to output_dir/docking_summary.txt.
@@ -224,7 +231,9 @@ def generate_summary_report(
     sorted_r    = sorted(docking_results, key=lambda x: x.get("best_score", 0.0))
 
     # ── RMSD status string ────────────────────────────────────────────────
-    if redock_rmsd <= 2.0:
+    if redock_rmsd is None:
+        rmsd_status = "SKIPPED  ─  (no valid 3D native ligand available)"
+    elif redock_rmsd <= 2.0:
         rmsd_status = f"PASS  ✓  ({redock_rmsd:.2f} Å ≤ 2.0 Å threshold)"
     elif redock_rmsd <= 3.0:
         rmsd_status = f"MARGINAL  ⚠  ({redock_rmsd:.2f} Å — interpret with caution)"
@@ -236,7 +245,7 @@ def generate_summary_report(
 
     lines: List[str] = [
         "=" * 72,
-        "  AI-GUIDED MOLECULAR DOCKING PIPELINE — SUMMARY REPORT",
+        "  MOLECULAR DOCKING PIPELINE — SUMMARY REPORT",
         f"  Generated : {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}",
         "=" * 72,
         "",
@@ -245,19 +254,22 @@ def generate_summary_report(
         f"  Ligands  : {len(ligand_files)} file(s)",
         *[f"    • {f}" for f in ligand_files],
         "",
-        "━━  AI ACTIVE-SITE IDENTIFICATION  (AI)",
+        "━━  ACTIVE-SITE SELECTION",
         f"  Identified ligand : {active_site_code}",
-        f"  Reasoning         : {ai_reason}",
+        f"  Target chain      : {target_chain}",
+        f"  Selection         : {selection_reason}",
         "",
         "━━  DOCKING GRID BOX",
         f"  Centre     : ({grid['center_x']:.3f},  {grid['center_y']:.3f},  "
         f"{grid['center_z']:.3f})  Å",
         f"  Dimensions : {grid['size_x']:.1f}  ×  {grid['size_y']:.1f}  ×  "
         f"{grid['size_z']:.1f}  Å",
-        "  Padding    : 4.0 Å per side (8.0 Å total per axis)",
+        f"  Padding    : {grid_padding:.1f} Å per side ({grid_padding * 2:.1f} Å total per axis)",
         "",
         "━━  VALIDATION — NATIVE LIGAND REDOCKING",
-        f"  Redock score : {redock_score:.2f} kcal/mol",
+        f"  Redock score : {redock_score:.2f} kcal/mol"
+        if redock_score and redock_rmsd is not None
+        else "  Redock score : SKIPPED",
         f"  RMSD status  : {rmsd_status}",
         "",
         "━━  PRODUCTION DOCKING RESULTS  (ranked by binding affinity)",
@@ -286,12 +298,12 @@ def generate_summary_report(
         f"  {'─' * 60}",
         "  cleaned_receptor.pdb       protein-only structure",
         "  cleaned_receptor.pdbqt     Meeko-prepared receptor",
-        "  native_ligand.pdb/.sdf     extracted crystal ligand",
         "  grid_box.txt               Vina grid configuration",
-        "  redocking/                 validation redock poses + log",
+        "  redocking/                 fetched native ligand + redock poses",
         "  ligands/                   prepared ligand PDBQT files",
         "  docking/                   docked poses per ligand",
         "  docking_summary.txt        this report",
+        "  MDP-log.txt                full pipeline log",
         "",
         "=" * 72,
     ]
@@ -305,15 +317,58 @@ def generate_summary_report(
 # ════════════════════════════════════════════════════════════════════════════
 
 def _resolve_executable(exe: str) -> Path:
-    """Resolve executable path or look it up in PATH environment variable."""
+    """Resolve executable path or look it up in PATH and common locations.
+
+    Works cross-platform:
+      - Checks path as-is
+      - On Windows, auto-appends ``.exe`` if the file is found that way
+      - Searches PATH via ``shutil.which``
+      - Falls back to platform-specific common install locations
+    """
     p = Path(exe)
-    if p.is_file() and os.access(p, os.X_OK):
+
+    # 1. Check if the path as-is points to an existing file
+    if p.is_file():
         return p.resolve()
-    
+
+    # 2. On Windows, try appending .exe when no extension is present
+    if os.name == "nt" and not p.suffix:
+        p_exe = p.with_suffix(".exe")
+        if p_exe.is_file():
+            return p_exe.resolve()
+
+    # 3. Look up in PATH (handles both "vina" and "vina.exe")
     found = shutil.which(exe)
+    if not found and os.name == "nt" and not exe.lower().endswith(".exe"):
+        found = shutil.which(exe + ".exe")
     if found:
         return Path(found).resolve()
-    
+
+    # 4. Platform-specific common install locations
+    if os.name == "nt":
+        common_paths = [
+            Path(r"C:\Program Files\AutoDock Vina\vina.exe"),
+            Path(r"C:\Program Files (x86)\AutoDock Vina\vina.exe"),
+            Path.home() / "AppData" / "Local" / "Programs" / "AutoDock Vina" / "vina.exe",
+            Path.home() / "miniconda3" / "Scripts" / "vina.exe",
+            Path.home() / "anaconda3" / "Scripts" / "vina.exe",
+            Path.home() / "miniforge3" / "Scripts" / "vina.exe",
+            Path.home() / "mambaforge" / "Scripts" / "vina.exe",
+        ]
+    else:
+        common_paths = [
+            Path("/usr/bin/vina"),
+            Path("/usr/local/bin/vina"),
+            Path.home() / "miniconda3" / "bin" / "vina",
+            Path.home() / "anaconda3" / "bin" / "vina",
+            Path.home() / "miniforge3" / "bin" / "vina",
+            Path.home() / "mambaforge" / "bin" / "vina",
+        ]
+
+    for candidate in common_paths:
+        if candidate.is_file():
+            return candidate.resolve()
+
     return p
 
 
@@ -342,42 +397,6 @@ def _parse_vina_scores(text: str) -> List[float]:
                 break
 
     return scores
-
-
-def _parse_pdb_heavy_coords(
-    pdb_file: Path,
-) -> List[Tuple[float, float, float]]:
-    """Parse heavy-atom coordinates from a PDB structure."""
-    coords: List[Tuple[float, float, float]] = []
-
-    if not pdb_file.is_file():
-        return coords
-
-    with open(pdb_file, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            rec = line[:6].strip()
-            if rec not in ("ATOM", "HETATM"):
-                continue
-            try:
-                element   = line[76:78].strip().upper() if len(line) >= 78 else ""
-                atom_name = line[12:16].strip()
-
-                if element == "H":
-                    continue
-                if not element:
-                    first = "".join(c for c in atom_name if not c.isdigit())[:1].upper()
-                    if first == "H":
-                        continue
-
-                coords.append((
-                    float(line[30:38]),
-                    float(line[38:46]),
-                    float(line[46:54]),
-                ))
-            except (ValueError, IndexError):
-                continue
-
-    return coords
 
 
 def _parse_pdbqt_model1_heavy_coords(
