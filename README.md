@@ -1,4 +1,4 @@
-# AI-Guided Molecular Docking Protocol (AGDP)
+# Advanced Molecular Docking Protocol (AMDP)
 
 An automated, end-to-end virtual screening pipeline that takes a raw receptor structure (**PDB or mmCIF**) and one or more ligand SDF files, identifies the active site deterministically, and runs a fully automated **AutoDock Vina** docking workflow — orchestrated through a clean Tkinter GUI.
 
