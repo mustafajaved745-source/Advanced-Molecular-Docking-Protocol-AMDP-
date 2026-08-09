@@ -18,8 +18,9 @@ The atom dicts expose the fields the rest of the pipeline needs to build
 the active-site panel, the docking grid box, and the RMSD reference —
 without ever writing an intermediate PDB file.
 
-Only the first model is kept (`_atom_site.pdbx_PDB_model_num`), matching
-how the PDB fixed-column parser reads every ATOM/HETATM line of the file.
+Only the first model is kept (`_atom_site.pdbx_PDB_model_num`).  The model
+number and both label/auth identifiers are nevertheless retained on every
+row so callers can construct an exact, auditable ligand-instance key.
 """
 
 from __future__ import annotations
@@ -216,22 +217,24 @@ def _normalize_row(row: Dict[str, str]) -> Optional[Dict]:
     if not group:
         return None
 
-    resn = _normalize(row.get("_atom_site.auth_comp_id", "")).upper()
-    if not resn:
-        resn = _normalize(row.get("_atom_site.label_comp_id", "")).upper()
+    auth_comp_id = _normalize(row.get("_atom_site.auth_comp_id", "")).upper()
+    label_comp_id = _normalize(row.get("_atom_site.label_comp_id", "")).upper()
+    resn = auth_comp_id or label_comp_id
 
-    chain = _normalize(row.get("_atom_site.auth_asym_id", ""))
-    if not chain:
-        chain = _normalize(row.get("_atom_site.label_asym_id", ""))
+    auth_chain_id = _normalize(row.get("_atom_site.auth_asym_id", ""))
+    label_asym_id = _normalize(row.get("_atom_site.label_asym_id", ""))
+    chain = auth_chain_id or label_asym_id
 
-    resi = _normalize(row.get("_atom_site.auth_seq_id", ""))
-    if not resi:
-        resi = _normalize(row.get("_atom_site.label_seq_id", ""))
+    auth_seq_id = _normalize(row.get("_atom_site.auth_seq_id", ""))
+    label_seq_id = _normalize(row.get("_atom_site.label_seq_id", ""))
+    resi = auth_seq_id or label_seq_id
 
     icode = _normalize(row.get("_atom_site.pdbx_PDB_ins_code", ""))
 
     element = _normalize(row.get("_atom_site.type_symbol", "")).upper()
-    atom_name = _normalize(row.get("_atom_site.label_atom_id", ""))
+    label_atom_id = _normalize(row.get("_atom_site.label_atom_id", ""))
+    auth_atom_id = _normalize(row.get("_atom_site.auth_atom_id", ""))
+    atom_name = label_atom_id or auth_atom_id
     if not element and atom_name:
         # Fallback: derive the element from the leading alphabetic run of
         # the atom name (e.g. "CA" -> C, "1HE2" -> H).
@@ -253,15 +256,25 @@ def _normalize_row(row: Dict[str, str]) -> Optional[Dict]:
 
     return {
         "group":     group,
+        "model_num": _normalize(row.get("_atom_site.pdbx_PDB_model_num", "")) or "1",
         "resn":      resn,
+        "component_id": label_comp_id or auth_comp_id,
+        "auth_comp_id": auth_comp_id,
+        "label_comp_id": label_comp_id,
         "chain":     chain,
+        "auth_chain_id": auth_chain_id,
+        "label_asym_id": label_asym_id,
         "resi":      resi,
+        "auth_seq_id": auth_seq_id,
+        "label_seq_id": label_seq_id,
         "icode":     icode,
         "x":         x,
         "y":         y,
         "z":         z,
         "element":   element,
         "atom_name": atom_name,
+        "auth_atom_id": auth_atom_id,
+        "label_atom_id": label_atom_id,
         "altloc":    _normalize(row.get("_atom_site.label_alt_id", "")),
         "occ":       _float_or("_atom_site.occupancy", 1.0),
         "bfac":      _float_or("_atom_site.B_iso_or_equiv", 0.0),
