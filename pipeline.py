@@ -12,7 +12,8 @@ Coordinates every step in order, calling the specialist modules:
   Stage 5 ─ Input ligand PDBQT preparation  (ligand_prep.py)
   Stage 6 ─ Validation redocking + RMSD     (docking.py)
   Stage 7 ─ Production docking              (docking.py)
-  Stage 8 ─ Summary report                  (docking.py)
+  Stage 8 ─ PLIP interaction analysis       (interaction_analysis.py)
+  Stage 9 ─ Summary report                  (docking.py)
 
 All log / progress / status updates are pushed through callbacks so the
 GUI thread is never touched directly from here.
@@ -27,15 +28,17 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from rdkit import Chem, RDLogger
 
-from hetatm_parser import parse_hetatm_records
+from hetatm_parser import parse_hetatm_records, build_docking_target_context
 from docking import calculate_redock_rmsd, generate_summary_report, run_vina_docking
+from interaction_analysis import combine_interaction_csvs, run_plip_interaction_analysis
 from ligand_prep import ensure_3d_sdf, prepare_ligand_pdbqt, prepare_receptor_pdbqt
+from llm_export import ExportOptions, export_experiment
 from receptor_prep import (
     calculate_grid_box,
     clean_receptor_with_pymol,
@@ -407,6 +410,7 @@ def run_pipeline(
     selected_chain: str = "",
     selected_ligand_code: str = "",
     ligand_status_cb: Optional[Callable[[str, str, str], None]] = None,
+    selected_ligand_instance: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Execute the full docking pipeline.
@@ -431,6 +435,10 @@ def run_pipeline(
     ligand_status_cb : Optional callback(ligand_file_path, status, detail)
                        for live per-ligand status updates in the GUI.
                        status ∈ {preparing, prep_failed, docking, ok, failed}.
+    selected_ligand_instance: Exact structural identity selected in the GUI.
+                              This disambiguates repeated ligand codes within
+                              one chain. Older callers may omit it when their
+                              chain/code pair resolves to exactly one instance.
     """
 
     def log(msg: str, lvl: str = "info") -> None:
@@ -449,6 +457,7 @@ def run_pipeline(
 
     # Record pipeline start time for elapsed-time reporting
     _pipeline_start = time.time()
+    _experiment_created = datetime.now(timezone.utc).isoformat()
 
     # ════════════════════════════════════════════════════════════════════
     #  STAGE 0 — Setup
@@ -508,20 +517,34 @@ def run_pipeline(
             "selection."
         )
 
-    match = next(
-        (
+    if selected_ligand_instance:
+        target_context = build_docking_target_context(
+            receptor_file, selected_ligand_instance
+        )
+        selected_key = target_context.instance_key
+        if (
+            target_context.component_id.upper() != ligand_code
+            or selected_key.chain_id.upper() != target_chain
+        ):
+            raise RuntimeError(
+                "INVALID_LIGAND_INSTANCE: selected ligand instance does not match "
+                f"[{ligand_code}] on chain [{target_chain}]. Re-load the receptor "
+                "and select the active site again."
+            )
+    else:
+        matches = [
             h for h in hetatms
             if h["resn"].upper() == ligand_code
             and h["chain"] == target_chain
             and not h["is_known_non_ligand"]
-        ),
-        None,
-    )
-    if match is None:
-        raise RuntimeError(
-            f"Selected ligand [{ligand_code}] was not found as a candidate "
-            f"on chain [{target_chain}] in the receptor PDB.\n"
-            "Re-select a chain and ligand in the Active Site Selection panel."
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"AMBIGUOUS_LIGAND_INSTANCE: [{ligand_code}] on chain [{target_chain}] "
+                f"has {len(matches)} candidate instances; select an exact instance."
+            )
+        target_context = build_docking_target_context(
+            receptor_file, matches[0]["instance_key"]
         )
 
     selection_reason = f"Manually selected by user: {ligand_code} in chain {target_chain}"
@@ -604,6 +627,7 @@ def run_pipeline(
         receptor_file=receptor_file,
         ligand_code=ligand_code,
         target_chain=target_chain,
+        ligand_instance=target_context.instance_key,
     )
     log(
         f"✔  Native ligand crystal coords : {len(native_coords)} heavy atoms",
@@ -688,6 +712,8 @@ def run_pipeline(
         pdb_file=cleaned_pdb,
         output_dir=output_dir,
         cmd=config["mk_prepare_receptor_cmd"],
+        target_chain=target_chain,
+        grid=grid,
         log_cb=log,
     )
 
@@ -813,7 +839,10 @@ def run_pipeline(
 
     redock_score: float = 0.0
     rmsd: Optional[float] = None
+    redock_result: Optional[dict[str, Any]] = None
 
+    if not (native_pdbqt and native_pdbqt.exists()):
+        raise RuntimeError("VALIDATION_BLOCKED: native ligand preparation failed; production docking is not permitted.")
     if native_pdbqt and native_pdbqt.exists():
         log(f"Re-docking native ligand [{ligand_code}] ({ligand_name}) back into pocket…", "info")
 
@@ -837,10 +866,10 @@ def run_pipeline(
             _compare_redock_atom_counts(native_coords, redock_result["output_pdbqt"], log)
             rmsd = calculate_redock_rmsd(native_coords, redock_result["output_pdbqt"])
             _report_rmsd(rmsd, log)
+            if rmsd > 2.0:
+                raise RuntimeError(f"VALIDATION_BLOCKED: redocking RMSD {rmsd:.2f} Å exceeds 2.0 Å threshold.")
         except Exception as e:
-            log(f"   RMSD calculation skipped: {e}", "warning")
-    else:
-        log("Online native ligand preparation failed — skipping validation redocking.", "warning")
+            raise RuntimeError(f"VALIDATION_BLOCKED: {e}") from e
 
     progress_cb(65.0)
 
@@ -886,6 +915,7 @@ def run_pipeline(
             docking_results.append(
                 {
                     "name": name,
+                    "source_file": lig_path,
                     "best_score": result["best_score"],
                     "all_scores": result["all_scores"],
                     "output_file": result["output_pdbqt"],
@@ -915,9 +945,113 @@ def run_pipeline(
         return
 
     # ════════════════════════════════════════════════════════════════════
-    #  STAGE 8 — Summary Report
+    #  STAGE 8 — Validation & Production Interaction Analysis (PLIP)
     # ════════════════════════════════════════════════════════════════════
-    banner("STAGE 8  ─  Summary Report")
+    banner("STAGE 8  ─  Validation & Production Interaction Analysis  (PLIP)")
+    status_cb("Analyzing protein-ligand interactions…")
+
+    interaction_dir = output_dir / "interactions"
+    interaction_dir.mkdir(exist_ok=True)
+    successful_dockings = [
+        result for result in docking_results if result.get("output_file")
+    ]
+    interaction_csvs: list[Path] = []
+    total_analyses = len(successful_dockings) + (1 if redock_result else 0)
+    completed_analyses = 0
+
+    if redock_result:
+        validation_name = f"Validation {ligand_code} ({ligand_name})"
+        log("", "dim")
+        log(f"[1/{total_analyses}]  PLIP analysis : {validation_name}", "bold")
+        try:
+            validation_analysis = run_plip_interaction_analysis(
+                receptor_pdbqt=receptor_pdbqt,
+                docked_poses_pdbqt=redock_result["output_pdbqt"],
+                ligand_name=validation_name,
+                output_dir=interaction_dir,
+                pymol_exe=config["pymol_exe"],
+                plip_cmd=config["plip_cmd"],
+                docking_type="validation",
+                best_docking_score=redock_result["best_score"],
+                all_docking_scores=redock_result["all_scores"],
+                log_cb=log,
+            )
+            redock_result["interaction_analysis"] = validation_analysis
+            interaction_csvs.append(validation_analysis["csv_report"])
+            counts = validation_analysis["interaction_counts"]
+            count_text = ", ".join(
+                f"{interaction_type}: {count}"
+                for interaction_type, count in counts.items()
+            ) or "no interactions detected"
+            log(
+                f"   ✔  {validation_analysis['interaction_count']} interaction(s): "
+                f"{count_text}",
+                "success",
+            )
+        except Exception as exc:
+            redock_result["interaction_error"] = str(exc)
+            log(f"   ✘  PLIP analysis failed for {validation_name}: {exc}", "error")
+        completed_analyses += 1
+        progress_cb(95.0 + completed_analyses * (4.0 / max(total_analyses, 1)))
+
+    for index, result in enumerate(successful_dockings):
+        if check_stop():
+            return
+        name = result["name"]
+        log("", "dim")
+        log(
+            f"[{completed_analyses + 1}/{total_analyses}]  PLIP analysis : {name}",
+            "bold",
+        )
+        try:
+            analysis = run_plip_interaction_analysis(
+                receptor_pdbqt=receptor_pdbqt,
+                docked_poses_pdbqt=result["output_file"],
+                ligand_name=name,
+                output_dir=interaction_dir,
+                pymol_exe=config["pymol_exe"],
+                plip_cmd=config["plip_cmd"],
+                docking_type="production",
+                best_docking_score=result["best_score"],
+                all_docking_scores=result["all_scores"],
+                log_cb=log,
+            )
+            result["interaction_analysis"] = analysis
+            interaction_csvs.append(analysis["csv_report"])
+            counts = analysis["interaction_counts"]
+            count_text = ", ".join(
+                f"{interaction_type}: {count}"
+                for interaction_type, count in counts.items()
+            ) or "no interactions detected"
+            log(
+                f"   ✔  {analysis['interaction_count']} interaction(s): {count_text}",
+                "success",
+            )
+        except Exception as exc:
+            result["interaction_error"] = str(exc)
+            log(f"   ✘  PLIP analysis failed for {name}: {exc}", "error")
+
+        completed_analyses += 1
+        progress_cb(95.0 + completed_analyses * (4.0 / max(total_analyses, 1)))
+
+    combined_interaction_csv: Path | None = None
+    if interaction_csvs:
+        combined_interaction_csv = combine_interaction_csvs(
+            interaction_csvs,
+            interaction_dir / "interaction_summary.csv",
+        )
+        log(
+            f"✔  Combined interaction table : {combined_interaction_csv.name}",
+            "success",
+        )
+
+    if check_stop():
+        return
+
+    # ════════════════════════════════════════════════════════════════════
+    #  STAGE 9 — Summary Report
+    # ════════════════════════════════════════════════════════════════════
+    banner("STAGE 9  ─  Summary Report")
     status_cb("Generating summary report…")
 
     report_path = generate_summary_report(
@@ -932,9 +1066,64 @@ def run_pipeline(
         redock_score=redock_score,
         docking_results=docking_results,
         grid_padding=grid_pad,
+        interaction_csv=combined_interaction_csv,
     )
 
     log(f"✔  Report written : {report_path.name}", "success")
+
+    llm_context = {
+        "experiment": {
+            "id": output_dir.name,
+            "created": _experiment_created,
+            "engine": "AutoDock Vina",
+            "exhaustiveness": exhaustiveness,
+            "num_modes": int(config.get("num_modes", 9)),
+            "energy_range": config.get("energy_range"),
+            "seed": config.get("seed"),
+        },
+        "receptor": {
+            "id": Path(receptor_file).stem,
+            "chains": [target_chain],
+            "prepared_from": Path(receptor_file).name,
+            "prep": {"waters_removed": True, "hydrogens_added": True},
+        },
+        "site": {
+            "id": 1,
+            "method": "reference_ligand",
+            "center": [grid["center_x"], grid["center_y"], grid["center_z"]],
+            "size": [grid["size_x"], grid["size_y"], grid["size_z"]],
+        },
+        "reference": {
+            "id": ligand_code,
+            "name": ligand_name,
+            "best_score": redock_result.get("best_score") if redock_result else None,
+            "redock_rmsd": rmsd,
+            "validation_threshold_A": 2.0,
+            "interaction_csv": str(redock_result.get("interaction_analysis", {}).get("csv_report", "")) if redock_result else "",
+        },
+        "ligands": [
+            {
+                "id": result["name"],
+                "scores": result.get("all_scores", []),
+                "source_file": result.get("source_file"),
+                "interaction_csv": str(result.get("interaction_analysis", {}).get("csv_report", "")),
+            }
+            for result in docking_results if result.get("all_scores")
+        ],
+        "provenance": {
+            "receptor_file": str(receptor_pdbqt),
+            "interaction_source": str(combined_interaction_csv) if combined_interaction_csv else None,
+            "software_version": "2.0.0",
+        },
+    }
+    manifest_path = output_dir / "dockllm-source.json"
+    manifest_path.write_text(json.dumps(llm_context, indent=2, default=str) + "\n", encoding="utf-8")
+    llm_path = export_experiment(
+        llm_context,
+        output_dir / "docking_experiment.llm.json",
+        ExportOptions(detail=str(config.get("llm_detail", "standard"))),
+    )
+    log(f"✔  LLM analysis file : {llm_path.name}", "success")
 
     # Final ranked table output
     log("", "dim")
