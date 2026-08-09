@@ -1,4 +1,4 @@
-"""
+a"""
 Molecular Docking Pipeline
 ==========================
 hetatm_parser.py — HETATM parsing for active-site selection
@@ -23,10 +23,91 @@ Public API
 from __future__ import annotations
 
 import re
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Mapping, Tuple
 
 from mmcif_parser import is_mmcif, iter_atom_site_rows
+
+
+@dataclass(frozen=True)
+class LigandInstanceKey:
+    """Full structural identity of one selected ligand conformer."""
+
+    model_num: str
+    component_id: str
+    auth_chain_id: str
+    label_asym_id: str
+    auth_seq_id: str
+    label_seq_id: str
+    insertion_code: str = ""
+    altloc: str = ""
+    occupancy: float = 1.0
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: Mapping) -> "LigandInstanceKey":
+        return cls(
+            model_num=str(value.get("model_num", "1")),
+            component_id=str(value.get("component_id", "")).upper(),
+            auth_chain_id=str(value.get("auth_chain_id", "")),
+            label_asym_id=str(value.get("label_asym_id", "")),
+            auth_seq_id=str(value.get("auth_seq_id", "")),
+            label_seq_id=str(value.get("label_seq_id", "")),
+            insertion_code=str(value.get("insertion_code", "")),
+            altloc=str(value.get("altloc", "")),
+            occupancy=float(value.get("occupancy", 1.0)),
+        )
+
+    @property
+    def chain_id(self) -> str:
+        return self.auth_chain_id or self.label_asym_id
+
+    @property
+    def sequence_id(self) -> str:
+        return self.auth_seq_id or self.label_seq_id
+
+    def display(self) -> str:
+        alt = self.altloc or "none"
+        ins = self.insertion_code or "none"
+        return (
+            f"model={self.model_num}; component={self.component_id}; "
+            f"auth_chain={self.auth_chain_id or '-'}; label_asym={self.label_asym_id or '-'}; "
+            f"auth_seq={self.auth_seq_id or '-'}; label_seq={self.label_seq_id or '-'}; "
+            f"ins={ins}; altloc={alt}; occupancy={self.occupancy:.3f}"
+        )
+
+
+@dataclass(frozen=True)
+class LigandAtomReference:
+    atom_id: str
+    element: str
+    xyz: Tuple[float, float, float]
+    altloc: str
+    occupancy: float
+
+
+@dataclass(frozen=True)
+class DockingTargetContext:
+    """Immutable selected instance shared by grid, chemistry and RMSD stages."""
+
+    source_file: str
+    instance_key: LigandInstanceKey
+    crystal_atoms: Tuple[LigandAtomReference, ...]
+
+    @property
+    def component_id(self) -> str:
+        return self.instance_key.component_id
+
+    @property
+    def crystal_coords(self) -> List[Tuple[float, float, float]]:
+        return [atom.xyz for atom in self.crystal_atoms]
+
+    @property
+    def crystal_atom_ids(self) -> List[str]:
+        return [atom.atom_id for atom in self.crystal_atoms]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -115,8 +196,20 @@ def iter_hetatm_atoms(structure_file: str | Path) -> Iterator[Dict]:
         return
 
     # ── PDB fixed-column parsing ────────────────────────────────────────
+    model_num = "1"
+    in_first_model = True
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
+            if line.startswith("MODEL"):
+                model_num = line[10:14].strip() or line[5:].strip() or "1"
+                in_first_model = model_num == "1"
+                continue
+            if line.startswith("ENDMDL"):
+                if in_first_model:
+                    break
+                continue
+            if not in_first_model:
+                continue
             if not line.startswith("HETATM"):
                 continue
 
@@ -149,15 +242,25 @@ def iter_hetatm_atoms(structure_file: str | Path) -> Iterator[Dict]:
 
             yield {
                 "group":     "HETATM",
+                "model_num": model_num,
                 "resn":      resn,
+                "component_id": resn,
+                "auth_comp_id": resn,
+                "label_comp_id": resn,
                 "chain":     chain,
+                "auth_chain_id": chain,
+                "label_asym_id": chain,
                 "resi":      resi,
+                "auth_seq_id": resi,
+                "label_seq_id": resi,
                 "icode":     icode,
                 "x":         x,
                 "y":         y,
                 "z":         z,
                 "element":   element,
                 "atom_name": atom_name,
+                "auth_atom_id": atom_name,
+                "label_atom_id": atom_name,
                 "altloc":    altloc,
                 "occ":       occ,
                 "bfac":      bfac,
@@ -195,7 +298,7 @@ def parse_hetatm_records(structure_file: str | Path) -> List[Dict]:
         centroid           : (cx, cy, cz) in Ångströms
         is_known_non_ligand: True if in the NON_LIGAND_RESNS reference set
     """
-    groups: Dict[str, Dict] = {}
+    base_groups: Dict[tuple, List[Dict]] = {}
     structure_path = Path(structure_file)
 
     if not structure_path.is_file():
@@ -204,34 +307,63 @@ def parse_hetatm_records(structure_file: str | Path) -> List[Dict]:
         )
 
     for atom in iter_hetatm_atoms(structure_path):
-        resn  = atom["resn"].upper()
-        chain = atom["chain"] or "A"
-        resi  = atom["resi"]
-        icode = atom["icode"]
-        resi_full = f"{resi}{icode}" if icode else resi
-        x, y, z = atom["x"], atom["y"], atom["z"]
-        element  = atom["element"]
+        base_key = (
+            atom.get("model_num", "1"),
+            atom.get("component_id") or atom["resn"].upper(),
+            atom.get("auth_chain_id", ""),
+            atom.get("label_asym_id", ""),
+            atom.get("auth_seq_id", ""),
+            atom.get("label_seq_id", ""),
+            atom.get("icode", ""),
+        )
+        base_groups.setdefault(base_key, []).append(atom)
 
-        key = f"{resn}|{chain}|{resi_full}"
-        if key not in groups:
-            groups[key] = {
+    groups: List[Dict] = []
+    for base_key, all_atoms in base_groups.items():
+        altlocs = sorted({a.get("altloc", "") for a in all_atoms if a.get("altloc", "")}) or [""]
+        for selected_altloc in altlocs:
+            atoms = [
+                a for a in all_atoms
+                if not a.get("altloc", "") or a.get("altloc", "") == selected_altloc
+            ]
+            occupancies = [float(a.get("occ", 1.0)) for a in atoms]
+            occupancy = min(occupancies, default=1.0)
+            instance_key = LigandInstanceKey(
+                model_num=str(base_key[0]),
+                component_id=str(base_key[1]).upper(),
+                auth_chain_id=str(base_key[2]),
+                label_asym_id=str(base_key[3]),
+                auth_seq_id=str(base_key[4]),
+                label_seq_id=str(base_key[5]),
+                insertion_code=str(base_key[6]),
+                altloc=selected_altloc,
+                occupancy=occupancy,
+            )
+            resn = instance_key.component_id
+            chain = instance_key.chain_id or "A"
+            resi = instance_key.sequence_id
+            resi_full = f"{resi}{instance_key.insertion_code}" if instance_key.insertion_code else resi
+            group = {
                 "resn":                resn,
                 "chain":               chain,
                 "resi":                resi_full,
+                "instance_key":        instance_key.to_dict(),
+                "instance_id":         instance_key.display(),
                 "atom_count":          0,
                 "heavy_atom_count":    0,
                 "_coords":             [],
                 "is_known_non_ligand": resn in NON_LIGAND_RESNS,
             }
-
-        groups[key]["atom_count"] += 1
-        groups[key]["_coords"].append((x, y, z))
-        if element not in ("H", "D"):
-            groups[key]["heavy_atom_count"] += 1
+            for atom in atoms:
+                group["atom_count"] += 1
+                group["_coords"].append((atom["x"], atom["y"], atom["z"]))
+                if atom["element"] not in ("H", "D"):
+                    group["heavy_atom_count"] += 1
+            groups.append(group)
 
     # Compute centroids and sort largest -> smallest
     result: List[Dict] = []
-    for g in groups.values():
+    for g in groups:
         coords = g.pop("_coords")
         if coords:
             n = len(coords)
@@ -245,6 +377,58 @@ def parse_hetatm_records(structure_file: str | Path) -> List[Dict]:
 
     result.sort(key=lambda g: g["heavy_atom_count"], reverse=True)
     return result
+
+
+def build_docking_target_context(
+    structure_file: str | Path,
+    instance: LigandInstanceKey | Mapping,
+) -> DockingTargetContext:
+    """Freeze one exact ligand instance and its labeled crystal heavy atoms."""
+    key = instance if isinstance(instance, LigandInstanceKey) else LigandInstanceKey.from_dict(instance)
+    atoms: List[LigandAtomReference] = []
+    seen_ids: set[str] = set()
+
+    for atom in iter_hetatm_atoms(structure_file):
+        if str(atom.get("model_num", "1")) != key.model_num:
+            continue
+        if (atom.get("component_id") or atom["resn"]).upper() != key.component_id:
+            continue
+        if str(atom.get("auth_chain_id", "")) != key.auth_chain_id:
+            continue
+        if str(atom.get("label_asym_id", "")) != key.label_asym_id:
+            continue
+        if str(atom.get("auth_seq_id", "")) != key.auth_seq_id:
+            continue
+        if str(atom.get("label_seq_id", "")) != key.label_seq_id:
+            continue
+        if str(atom.get("icode", "")) != key.insertion_code:
+            continue
+        atom_altloc = str(atom.get("altloc", ""))
+        if atom_altloc and atom_altloc != key.altloc:
+            continue
+        if atom["element"] in ("H", "D"):
+            continue
+        atom_id = str(atom.get("label_atom_id") or atom.get("auth_atom_id") or atom["atom_name"])
+        if not atom_id or atom_id in seen_ids:
+            raise RuntimeError(
+                "INVALID_REFERENCE_MAPPING: selected ligand instance has missing or "
+                f"duplicate heavy-atom ID '{atom_id}'."
+            )
+        seen_ids.add(atom_id)
+        atoms.append(LigandAtomReference(
+            atom_id=atom_id,
+            element=str(atom["element"]).upper(),
+            xyz=(float(atom["x"]), float(atom["y"]), float(atom["z"])),
+            altloc=atom_altloc,
+            occupancy=float(atom.get("occ", 1.0)),
+        ))
+
+    if not atoms:
+        raise RuntimeError(
+            "INVALID_LIGAND_INSTANCE: the exact selected ligand instance no longer "
+            "exists in the receptor structure. Re-load and re-select the target."
+        )
+    return DockingTargetContext(str(Path(structure_file).resolve()), key, tuple(atoms))
 
 
 def build_chain_ligand_map(hetatms: List[Dict]) -> Dict[str, List[Dict]]:
