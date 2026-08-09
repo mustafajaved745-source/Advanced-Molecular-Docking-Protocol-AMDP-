@@ -11,6 +11,7 @@ Handles:
 
 import json
 import os
+import shutil
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -35,6 +36,7 @@ DEFAULT_CONFIG: dict = {
     "pymol_exe": "",  # PyMOL binary (used with -c flag)
     "mk_prepare_ligand_cmd": "",  # mk_prepare_ligand script/executable
     "mk_prepare_receptor_cmd": "",  # mk_prepare_receptor script/executable
+    "plip_cmd": shutil.which("plip") or "",  # PLIP executable or plipcmd.py
     # ── Output ───────────────────────────────────────────────────────────
     "output_dir": str(Path.home() / "docking_results"),
     # ── Docking parameters ───────────────────────────────────────────────
@@ -103,12 +105,13 @@ def validate_config(config: dict) -> list[str]:
         "pymol_exe": "PyMOL executable",
         "mk_prepare_ligand_cmd": "mk_prepare_ligand command/script",
         "mk_prepare_receptor_cmd": "mk_prepare_receptor command/script",
+        "plip_cmd": "PLIP command/script",
     }
     for key, label in exe_fields.items():
         val = str(config.get(key, "")).strip()
         if not val:
             errors.append(f"{label} path is not set.")
-        elif not Path(val).exists():
+        elif not Path(val).expanduser().exists() and shutil.which(val) is None:
             errors.append(f"{label} not found at: {val}")
 
     # API key is optional — active-site selection is now done manually in the
@@ -149,7 +152,7 @@ class SettingsDialog:
 
         dlg = tk.Toplevel(parent)
         dlg.title("Settings — Molecular Docking Pipeline")
-        dlg.geometry("740x580")
+        dlg.geometry("740x660")
         dlg.resizable(True, False)
         dlg.transient(parent)
         dlg.grab_set()
@@ -246,6 +249,12 @@ class SettingsDialog:
                 "mk_prepare_receptor:",
                 "mk_prepare_receptor_cmd",
                 "Meeko receptor prep script or executable. e.g. mk_prepare_receptor (on PATH)",
+                "file",
+            ),
+            (
+                "PLIP:",
+                "plip_cmd",
+                "PLIP executable or plipcmd.py. Used for production-pose interaction reports.",
                 "file",
             ),
             (
@@ -574,5 +583,4 @@ def _initial_dir(current_val: str) -> str:
         if candidate.exists():
             return str(candidate)
     return str(Path.home())
-
 
