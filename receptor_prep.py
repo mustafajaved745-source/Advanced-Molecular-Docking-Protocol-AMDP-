@@ -37,12 +37,18 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import subprocess
 import textwrap
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple
 
-from hetatm_parser import iter_hetatm_atoms
+from hetatm_parser import (
+    DockingTargetContext,
+    LigandInstanceKey,
+    build_docking_target_context,
+    parse_hetatm_records,
+)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -205,6 +211,7 @@ def extract_native_ligand_coords(
     receptor_file: str | Path,
     ligand_code: str,
     target_chain: str,
+    ligand_instance: LigandInstanceKey | dict | None = None,
 ) -> List[Tuple[float, float, float]]:
     """
     Return the heavy-atom crystal coordinates of the selected native ligand,
@@ -233,41 +240,20 @@ def extract_native_ligand_coords(
         If no matching HETATM atoms are found in the receptor structure.
     """
     receptor_path = Path(receptor_file).resolve()
-
-    target_ligand = ligand_code.upper()
-    target_chain_str = target_chain.upper()
-
-    # Group matching HETATM atoms by chain:  {chain: [(x, y, z), ...]}
-    by_chain: Dict[str, List[Tuple[float, float, float]]] = {}
-    for atom in iter_hetatm_atoms(receptor_path):
-        if atom["resn"].upper() != target_ligand:
-            continue
-        if atom["element"] in ("H", "D"):
-            continue
-        by_chain.setdefault(atom["chain"] or "A", []).append(
-            (atom["x"], atom["y"], atom["z"])
-        )
-
-    if not by_chain:
-        raise RuntimeError(
-            f"No HETATM atoms found for ligand '{target_ligand}' "
-            f"on any chain in {receptor_path}.\n"
-            "Cannot compute the docking grid box."
-        )
-
-    if target_chain_str in by_chain:
-        coords = by_chain[target_chain_str]
-    else:
-        # Fallback: use the chain with the most matching atoms.
-        best_chain = max(by_chain, key=lambda k: len(by_chain[k]))
-        coords = by_chain[best_chain]
-        logging.warning(
-            f"Ligand '{target_ligand}' not found on chain '{target_chain_str}' "
-            f"but found on chain(s) {list(by_chain.keys())}. "
-            f"Using chain '{best_chain}' ({len(coords)} heavy atoms)."
-        )
-
-    return coords
+    if ligand_instance is None:
+        matches = [
+            h for h in parse_hetatm_records(receptor_path)
+            if h["resn"].upper() == ligand_code.upper()
+            and h["chain"] == target_chain
+            and not h["is_known_non_ligand"]
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "AMBIGUOUS_LIGAND_INSTANCE: chain/component selection resolved to "
+                f"{len(matches)} instances; an exact ligand-instance key is required."
+            )
+        ligand_instance = matches[0]["instance_key"]
+    return build_docking_target_context(receptor_path, ligand_instance).crystal_coords
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -278,7 +264,7 @@ def calculate_grid_box(
     coords: List[Tuple[float, float, float]],
     padding: float = 4.0,
     min_size: float = 12.0,
-    max_dimension: float = 25.0,
+    max_dimension: float | None = 60.0,
 ) -> Dict[str, float]:
     """
     Compute the AutoDock Vina docking grid box from native-ligand
@@ -290,14 +276,12 @@ def calculate_grid_box(
                     e.g. from extract_native_ligand_coords().
     padding       : Extra padding per side in Å (default 4.0).
     min_size      : Minimum grid dimension in Å (default 12.0).
-    max_dimension : Maximum grid dimension in Å (default 25.0).
-                    Keeps volume ≤ 25³ = 15,625 Å³, well under
-                    Vina's recommended 27,000 Å³ limit.
+    max_dimension : Optional policy ceiling.  A box that exceeds it is
+                    rejected; it is never clipped.
 
     Returns
     -------
-    Dict with center_x/y/z, size_x/y/z, and a boolean '_clamped'
-    flag indicating whether any axis was truncated.
+    Dict with center_x/y/z, size_x/y/z and clearance audit fields.
     """
     if not coords:
         raise ValueError(
@@ -316,26 +300,58 @@ def calculate_grid_box(
     cy = (max_y + min_y) / 2.0
     cz = (max_z + min_z) / 2.0
 
-    # Dimension = span + padding on both sides, clamped [min_size, max_dimension]
-    sx = max(min(max_x - min_x + 2.0 * padding, max_dimension), min_size)
-    sy = max(min(max_y - min_y + 2.0 * padding, max_dimension), min_size)
-    sz = max(min(max_z - min_z + 2.0 * padding, max_dimension), min_size)
-
-    clamped = (
-        (max_x - min_x + 2.0 * padding > max_dimension)
-        or (max_y - min_y + 2.0 * padding > max_dimension)
-        or (max_z - min_z + 2.0 * padding > max_dimension)
+    required = (
+        max(max_x - min_x + 2.0 * padding, min_size),
+        max(max_y - min_y + 2.0 * padding, min_size),
+        max(max_z - min_z + 2.0 * padding, min_size),
     )
+    if max_dimension is not None and any(size > max_dimension for size in required):
+        raise RuntimeError(
+            "GRID_TOO_LARGE_FOR_POLICY: required dimensions are "
+            f"{required[0]:.2f} × {required[1]:.2f} × {required[2]:.2f} Å, "
+            f"exceeding the configured {max_dimension:.2f} Å per-axis ceiling."
+        )
 
-    return {
+    # Round outward, never inward, so serialization cannot lose clearance.
+    sx, sy, sz = (math.ceil(v * 100.0) / 100.0 for v in required)
+
+    grid = {
         "center_x": round(cx, 4),
         "center_y": round(cy, 4),
         "center_z": round(cz, 4),
         "size_x": round(sx, 2),
         "size_y": round(sy, 2),
         "size_z": round(sz, 2),
-        "_clamped": clamped,
+        "_required_size_x": round(required[0], 4),
+        "_required_size_y": round(required[1], 4),
+        "_required_size_z": round(required[2], 4),
+        "_clamped": False,
     }
+    validate_grid_contains(coords, grid, padding)
+    return grid
+
+
+def validate_grid_contains(
+    coords: List[Tuple[float, float, float]],
+    grid: Dict[str, float],
+    padding: float,
+    tolerance: float = 0.011,
+) -> float:
+    """Prove every reference atom is in the grid with requested clearance."""
+    minima = [grid[f"center_{a}"] - grid[f"size_{a}"] / 2.0 for a in "xyz"]
+    maxima = [grid[f"center_{a}"] + grid[f"size_{a}"] / 2.0 for a in "xyz"]
+    min_clearance = float("inf")
+    for xyz in coords:
+        for i, value in enumerate(xyz):
+            clearance = min(value - minima[i], maxima[i] - value)
+            min_clearance = min(min_clearance, clearance)
+            if clearance + tolerance < padding:
+                raise RuntimeError(
+                    "INVALID_GRID_CLEARANCE: a crystal-reference heavy atom has "
+                    f"only {clearance:.4f} Å clearance; {padding:.4f} Å is required."
+                )
+    grid["_min_clearance"] = round(min_clearance, 4)
+    return min_clearance
 
 
 # ════════════════════════════════════════════════════════════════════════════
