@@ -107,6 +107,8 @@ def prepare_receptor_pdbqt(
     pdb_file: Path,
     output_dir: Path,
     cmd: str,
+    target_chain: str = "",
+    grid: dict[str, float] | None = None,
     log_cb: Callable[[str, str], None] | None = None,
 ) -> Path:
     """
@@ -133,8 +135,6 @@ def prepare_receptor_pdbqt(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     out_pdbqt = output_dir / f"{pdb_file.stem}.pdbqt"
-    protein_pdb: Path | None = None  # only created on timeout fallback
-
     def _try_meeko(
         input_pdb: Path,
         timeout_s: int,
@@ -174,22 +174,12 @@ def prepare_receptor_pdbqt(
          "--default_altloc", "A", "--allow_bad_res"],
     )
 
-    # ── Attempt 2: timeout → strip HETATMs, retry with full timeout ─────
-    if (result is None or result.returncode != 0 or not out_pdbqt.exists()
-            or out_pdbqt.stat().st_size == 0):
-        log("  Complex cofactor detected — retrying with protein-only PDB "
-            "(HETATM records stripped)…", "dim")
-        protein_pdb = output_dir / f"{pdb_file.stem}_protein.pdb"
-        _strip_hetatms(pdb_file, protein_pdb)
-        result = _try_meeko(
-            protein_pdb, 300,
-            ["-i", str(protein_pdb), "-o", out_basename, "-p",
-             "--default_altloc", "A", "--allow_bad_res"],
-            ["-i", str(protein_pdb), "-o", str(out_pdbqt),
-             "--default_altloc", "A", "--allow_bad_res"],
-        )
-
     # ── Validate output ───────────────────────────────────────────────────
+    if result is None:
+        raise RuntimeError(
+            "TIMEOUT: mk_prepare_receptor exceeded the preparation timeout; "
+            "the receptor model was not changed or retried without cofactors."
+        )
     if result and result.returncode != 0:
         hint = _receptor_hint(result.stderr)
         raise RuntimeError(
@@ -199,30 +189,109 @@ def prepare_receptor_pdbqt(
         )
 
     if not out_pdbqt.exists() or out_pdbqt.stat().st_size == 0:
-        # ── OpenBabel fallback for receptor PDBQT ──────────────────────
-        obabel_bin = shutil.which("obabel")
-        if obabel_bin:
-            log("  Meeko produced no output; attempting OpenBabel fallback…", "warning")
-            ob_cmd = [obabel_bin, str(pdb_file), "-O", str(out_pdbqt)]
-            ob_res = subprocess.run(ob_cmd, capture_output=True, text=True, timeout=120)
-            if ob_res.returncode == 0 and out_pdbqt.exists() and out_pdbqt.stat().st_size > 0:
-                log(f"  → {out_pdbqt.name}  ({out_pdbqt.stat().st_size // 1024} KB)  [OpenBabel]", "info")
-                return out_pdbqt
-
         raise RuntimeError(
-            "mk_prepare_receptor produced no output PDBQT file.\n"
+            "INVALID_RECEPTOR_PDBQT: mk_prepare_receptor produced no output file.\n"
             "Possible causes:\n"
             "  - The cleaned PDB has no ATOM records\n"
             "  - Meeko could not assign atom types to non-standard residues\n"
-            "  - Output file path was blocked or invalid\n"
-            "Tip: Install OpenBabel (obabel) as a fallback: conda install -c conda-forge openbabel"
+            "  - Output file path was blocked or invalid"
         )
+
+    integrity = validate_receptor_pdbqt_integrity(
+        pdb_file, out_pdbqt, target_chain=target_chain, grid=grid
+    )
+    log(
+        "  Receptor integrity: "
+        f"{integrity['output_heavy_atoms']}/{integrity['input_heavy_atoms']} heavy atoms, "
+        f"{integrity['output_residues']}/{integrity['input_residues']} residues retained",
+        "dim",
+    )
 
     log(
         f"  -> {out_pdbqt.name}  ({out_pdbqt.stat().st_size // 1024} KB)",
         "dim",
     )
     return out_pdbqt
+
+
+def _structure_inventory(path: Path) -> dict:
+    atoms: list[tuple[tuple[str, str, str, str], tuple[float, float, float]]] = []
+    chains: set[str] = set()
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line[:6].strip() not in ("ATOM", "HETATM"):
+                continue
+            atom_name = line[12:16].strip()
+            ad_type = line[77:79].strip().upper() if len(line) >= 79 else ""
+            element = line[76:78].strip().upper() if path.suffix.lower() == ".pdb" else ad_type
+            if not element:
+                element = "".join(c for c in atom_name if c.isalpha())[:1].upper()
+            if element in ("H", "HD", "HS", "D"):
+                continue
+            chain = line[21].strip()
+            residue = (chain, line[17:20].strip(), line[22:26].strip(), line[26].strip())
+            try:
+                xyz = (float(line[30:38]), float(line[38:46]), float(line[46:54]))
+            except ValueError:
+                continue
+            atoms.append((residue, xyz))
+            chains.add(chain)
+    return {"atoms": atoms, "residues": {a[0] for a in atoms}, "chains": chains}
+
+
+def validate_receptor_pdbqt_integrity(
+    cleaned_pdb: Path,
+    receptor_pdbqt: Path,
+    target_chain: str = "",
+    grid: dict[str, float] | None = None,
+    min_atom_fraction: float = 0.80,
+    min_residue_fraction: float = 0.90,
+    pocket_shell: float = 2.0,
+) -> dict:
+    """Fail closed if Meeko silently drops the receptor or target pocket."""
+    source = _structure_inventory(Path(cleaned_pdb))
+    output = _structure_inventory(Path(receptor_pdbqt))
+    input_atoms = len(source["atoms"])
+    output_atoms = len(output["atoms"])
+    input_residues = len(source["residues"])
+    output_residues = len(output["residues"])
+    if input_atoms == 0 or input_residues == 0:
+        raise RuntimeError("INVALID_RECEPTOR_INPUT: cleaned receptor has no heavy atoms/residues.")
+    if output_atoms < input_atoms * min_atom_fraction or output_residues < input_residues * min_residue_fraction:
+        raise RuntimeError(
+            "INVALID_RECEPTOR_PDBQT: Meeko retained only "
+            f"{output_atoms}/{input_atoms} heavy atoms and "
+            f"{output_residues}/{input_residues} residues."
+        )
+    if target_chain and target_chain not in output["chains"]:
+        raise RuntimeError(
+            f"INVALID_RECEPTOR_PDBQT: selected target chain '{target_chain}' is absent."
+        )
+    if grid:
+        bounds = [
+            (
+                grid[f"center_{axis}"] - grid[f"size_{axis}"] / 2.0 - pocket_shell,
+                grid[f"center_{axis}"] + grid[f"size_{axis}"] / 2.0 + pocket_shell,
+            )
+            for axis in "xyz"
+        ]
+        pocket_residues = {
+            residue for residue, xyz in source["atoms"]
+            if all(bounds[i][0] <= xyz[i] <= bounds[i][1] for i in range(3))
+        }
+        missing = sorted(pocket_residues - output["residues"])
+        if missing:
+            preview = ", ".join(f"{r[0]}:{r[1]}{r[2]}{r[3]}" for r in missing[:8])
+            raise RuntimeError(
+                "INVALID_RECEPTOR_PDBQT: receptor residues inside/near the docking "
+                f"box were omitted: {preview}"
+            )
+    return {
+        "input_heavy_atoms": input_atoms,
+        "output_heavy_atoms": output_atoms,
+        "input_residues": input_residues,
+        "output_residues": output_residues,
+    }
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -462,21 +531,6 @@ def _build_cmd(cmd_str: str, extra_args: List[str]) -> List[str]:
     return [cmd_str] + extra_args
 
 
-def _strip_hetatms(
-    src: Path,
-    dst: Path,
-) -> None:
-    """Copy *src* PDB to *dst* omitting HETATM records.
-
-    Meeko's ``mk_prepare_receptor`` hangs on complex cofactors (heme,
-    metal clusters, non-standard residues).  Stripping HETATM lines gives
-    it a clean protein-only input that it processes reliably.
-    """
-    with open(src, "r", encoding="utf-8", errors="replace") as fh:
-        atms = [ln for ln in fh if not ln.startswith("HETATM")]
-    dst.write_text("".join(atms), encoding="utf-8")
-
-
 def _run(
     cmd: List[str],
     timeout: int = 120,
@@ -511,6 +565,10 @@ def _relay(
         "NOT IN RESIDUE_TEMPLATES",
         "TRYING TO RESOLVE UNKNOWN RESIDUES",
     )
+    _ZERO_ERROR_SUMMARIES = {
+        "PDBQT FILES NOT WRITTEN DUE TO ERROR: 0",
+        "INPUT MOLECULES WITH ERRORS: 0",
+    }
 
     combined = (result.stdout or "") + (result.stderr or "")
     for raw in combined.splitlines():
@@ -518,7 +576,10 @@ def _relay(
         if not line:
             continue
         upper = line.upper()
-        if "ERROR" in upper or "TRACEBACK" in upper:
+        if upper in _ZERO_ERROR_SUMMARIES:
+            # Successful Meeko summary; keep it in the full log only.
+            log(f"    Meeko > {line}", "dim")
+        elif "ERROR" in upper or "TRACEBACK" in upper:
             log(f"    Meeko > {line}", "error")
         elif "WARNING" in upper or "WARN" in upper:
             # Downgrade known-harmless Meeko warnings to dim
