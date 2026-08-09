@@ -16,6 +16,7 @@ Dependencies (besides stdlib):
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import queue
@@ -64,6 +65,7 @@ class LogCollector:
 # ── Local pipeline modules ──────────────────────────────────────────────────
 try:
     from hetatm_parser import build_chain_ligand_map, parse_hetatm_records
+    from llm_export import ExportOptions, export_experiment
     from pipeline import run_pipeline
     from settings import SettingsDialog, load_config, validate_config
 except ImportError as _e:
@@ -98,9 +100,11 @@ class DockingApp:
         # Active-site selection state (populated at receptor load time)
         self.selected_chain: str = ""
         self.selected_ligand_code: str = ""
+        self.selected_ligand_instance: dict = {}
         self._chain_map: dict[str, list[dict]] = {}
         self._ligand_agg: dict[str, dict] = {}
         self._lig_index_resn: dict[int, str] = {}
+        self._lig_index_instance: dict[int, dict] = {}
         self._lig_greyed: dict[int, bool] = {}
         self._resn_chains: dict[str, list[str]] = {}
         self.active_site_chain_var = tk.StringVar()
@@ -193,6 +197,13 @@ class DockingApp:
             style="Small.TButton",
             command=self._open_settings,
         ).pack(side=tk.RIGHT)
+
+        ttk.Button(
+            row,
+            text="Export LLM JSON",
+            style="Small.TButton",
+            command=self._export_llm_json,
+        ).pack(side=tk.RIGHT, padx=(0, 6))
 
         ttk.Label(
             row,
@@ -377,6 +388,7 @@ class DockingApp:
         chain = self.active_site_chain_var.get()
         self.selected_chain = chain
         self.selected_ligand_code = ""
+        self.selected_ligand_instance = {}
         self._render_ligand_list(chain)
         self.active_site_note_var.set("")
 
@@ -384,15 +396,18 @@ class DockingApp:
         sel = self.lig_sel.curselection()
         if not sel:
             self.selected_ligand_code = ""
+            self.selected_ligand_instance = {}
             self.active_site_note_var.set("")
             return
         idx = sel[0]
         if self._lig_greyed.get(idx, False):
             self.lig_sel.selection_clear(0, tk.END)
             self.selected_ligand_code = ""
+            self.selected_ligand_instance = {}
             return
         resn = self._lig_index_resn.get(idx, "")
         self.selected_ligand_code = resn
+        self.selected_ligand_instance = dict(self._lig_index_instance.get(idx, {}))
         chains = self._resn_chains.get(resn, [])
         if len(chains) > 1:
             self.active_site_note_var.set(
@@ -407,6 +422,7 @@ class DockingApp:
         """Rebuild the ligand selector for *chain*; ligands absent there are greyed."""
         self.lig_sel.delete(0, tk.END)
         self._lig_index_resn = {}
+        self._lig_index_instance = {}
         self._lig_greyed = {}
         self._resn_chains = {}
 
@@ -415,29 +431,25 @@ class DockingApp:
             all_chains = entry["chains"]
             self._resn_chains[resn] = all_chains
 
-            if chain in entry["per_chain"]:
-                inst = entry["per_chain"][chain]
-                resi = inst["resi"]
-                heavy = inst["heavy_atom_count"]
-                greyed = False
-            else:
-                first = entry["per_chain"][all_chains[0]]
-                resi = first["resi"]
-                heavy = max(
-                    i["heavy_atom_count"] for i in entry["per_chain"].values()
-                )
-                greyed = True
+            instances = entry["per_chain"].get(chain, [])
+            greyed = not instances
+            if not instances:
+                instances = [entry["per_chain"][all_chains[0]][0]]
 
-            label = (
-                f"{resn}  │  resi {resi}  │  {heavy} heavy atoms  │  "
-                f"chains: {', '.join(all_chains)}"
-            )
-            idx = self.lig_sel.size()
-            self.lig_sel.insert(tk.END, label)
-            self._lig_index_resn[idx] = resn
-            self._lig_greyed[idx] = greyed
-            if greyed:
-                self.lig_sel.itemconfig(idx, foreground="#aab2b8")
+            for inst in instances:
+                key = inst["instance_key"]
+                altloc = key.get("altloc") or "-"
+                label = (
+                    f"{resn}  │  resi {inst['resi']}  │  alt {altloc}  │  "
+                    f"{inst['heavy_atom_count']} heavy atoms  │  chains: {', '.join(all_chains)}"
+                )
+                idx = self.lig_sel.size()
+                self.lig_sel.insert(tk.END, label)
+                self._lig_index_resn[idx] = resn
+                self._lig_index_instance[idx] = dict(key)
+                self._lig_greyed[idx] = greyed
+                if greyed:
+                    self.lig_sel.itemconfig(idx, foreground="#aab2b8")
 
     def _aggregate_ligands(self, chain_map: dict[str, list[dict]]) -> dict[str, dict]:
         agg: dict[str, dict] = {}
@@ -445,12 +457,13 @@ class DockingApp:
             for h in hetatms:
                 resn = h["resn"]
                 entry = agg.setdefault(resn, {"chains": [], "per_chain": {}})
-                if chain not in entry["per_chain"]:
-                    entry["per_chain"][chain] = h
+                entry["per_chain"].setdefault(chain, []).append(h)
                 if chain not in entry["chains"]:
                     entry["chains"].append(chain)
         for entry in agg.values():
             entry["chains"].sort()
+            for instances in entry["per_chain"].values():
+                instances.sort(key=lambda item: (item["resi"], item["instance_id"]))
         return agg
 
     # ── Status bar / progress ────────────────────────────────────────────────
@@ -521,7 +534,10 @@ class DockingApp:
         )
         self.log_widget.pack(fill=tk.BOTH, expand=True)
 
-        # Intercept keystrokes so text is read-only without forcing disabled state
+        # Keep the log read-only while preserving standard copy shortcuts.
+        self.log_widget.bind("<Control-c>", self._copy_log_selection)
+        if platform.system() == "Darwin":
+            self.log_widget.bind("<Command-c>", self._copy_log_selection)
         self.log_widget.bind("<Key>", lambda e: "break")
 
         _tags: dict[str, tuple[str, str]] = {
@@ -550,6 +566,7 @@ class DockingApp:
         ("Ligand Prep", 55.0),
         ("Redock", 65.0),
         ("Docking", 95.0),
+        ("Interactions", 99.0),
         ("Summary", 100.0),
     ]
 
@@ -659,10 +676,12 @@ class DockingApp:
     def _load_receptor_ligands(self, path: str) -> None:
         self.selected_chain = ""
         self.selected_ligand_code = ""
+        self.selected_ligand_instance = {}
         self.active_site_chain_var.set("")
         self.active_site_note_var.set("Parsing receptor HETATM records…")
         self.lig_sel.delete(0, tk.END)
         self._lig_index_resn = {}
+        self._lig_index_instance = {}
         self._lig_greyed = {}
         self._resn_chains = {}
 
@@ -776,6 +795,36 @@ class DockingApp:
         self.profile_lbl.configure(text=f"Profile: {self.profile_name}")
         self._write_log("Settings updated.", "dim")
 
+    def _export_llm_json(self) -> None:
+        """Export a compact self-contained docking summary from a run manifest."""
+        manifest = filedialog.askopenfilename(
+            title="Select DockLLM Source Manifest",
+            parent=self.root,
+            filetypes=[("DockLLM source", "dockllm-source.json"), ("JSON files", "*.json")],
+        )
+        if not manifest:
+            return
+        output = filedialog.asksaveasfilename(
+            title="Export LLM Analysis File",
+            parent=self.root,
+            defaultextension=".json",
+            initialfile="docking_experiment.llm.json",
+            filetypes=[("LLM analysis JSON", "*.json")],
+        )
+        if not output:
+            return
+        try:
+            context = json.loads(Path(manifest).read_text(encoding="utf-8"))
+            export_experiment(context, output, ExportOptions())
+        except Exception as exc:
+            messagebox.showerror("Export Failed", str(exc), parent=self.root)
+            return
+        messagebox.showinfo(
+            "Export Complete",
+            "Compact self-contained docking summary exported for language-model analysis.",
+            parent=self.root,
+        )
+
     # ════════════════════════════════════════════════════════════════════════
     #  Pipeline execution
     # ════════════════════════════════════════════════════════════════════════
@@ -809,7 +858,7 @@ class DockingApp:
                 messagebox.showerror("File Not Found", f"Ligand file not found:\n{lf}")
                 return
 
-        if not self.selected_chain or not self.selected_ligand_code:
+        if not self.selected_chain or not self.selected_ligand_code or not self.selected_ligand_instance:
             messagebox.showerror(
                 "No Active Site Selected",
                 "No active site selected. Load a receptor structure (PDB or "
@@ -890,6 +939,7 @@ class DockingApp:
                 write_log_fn=lambda path: self._log_collector.save(path),
                 selected_chain=self.selected_chain,
                 selected_ligand_code=self.selected_ligand_code,
+                selected_ligand_instance=self.selected_ligand_instance,
                 ligand_status_cb=lambda key, status, detail: self._queue(
                     "lig_status", (key, status, detail)
                 ),
@@ -956,6 +1006,11 @@ class DockingApp:
 
     _LOG_ICONS = {"success": "✓ ", "warning": "⚠ ", "error": "✗ "}
     _LOG_ICON_CHARS = ("✓", "✗", "⚠", "✔", "✘", "❌", "⏹")
+
+    def _copy_log_selection(self, _event=None) -> str:
+        """Copy selected log text while keeping the widget read-only."""
+        self.log_widget.event_generate("<<Copy>>")
+        return "break"
 
     def _write_log(self, message: str, level: str = "info") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
