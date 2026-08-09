@@ -197,6 +197,10 @@ def calculate_redock_rmsd(
 
         if not native_coords or not docked_coords:
             return 999.0
+        if len(native_coords) != len(docked_coords):
+            # Never match a favorable subset: atom identity/count is a
+            # prerequisite for a scientifically meaningful RMSD.
+            return 999.0
 
         return _optimal_rmsd(native_coords, docked_coords)
 
@@ -220,6 +224,7 @@ def generate_summary_report(
     redock_score:    float = 0.0,
     docking_results: List[Dict] = None,
     grid_padding:    float = 8.0,
+    interaction_csv: Optional[Path] = None,
 ) -> Path:
     """
     Write a plain-text summary report to output_dir/docking_summary.txt.
@@ -293,6 +298,46 @@ def generate_summary_report(
 
     lines += [
         "",
+        "━━  PLIP PROTEIN-LIGAND INTERACTION ANALYSIS",
+        "",
+    ]
+    for r in sorted_r:
+        name = r.get("name", "Unknown")
+        analysis = r.get("interaction_analysis")
+        if analysis:
+            counts = analysis.get("interaction_counts", {})
+            count_text = ", ".join(
+                f"{kind}: {count}" for kind, count in counts.items()
+            ) or "No interactions detected"
+            lines.extend(
+                [
+                    f"  {name}: {analysis.get('interaction_count', 0)} interaction(s)",
+                    f"    {count_text}",
+                    f"    Complex : {analysis.get('complex_pdb')}",
+                    f"    Report  : {analysis.get('text_report')}",
+                    f"    CSV     : {analysis.get('csv_report')}",
+                ]
+            )
+        elif r.get("interaction_error"):
+            lines.extend(
+                [
+                    f"  {name}: ANALYSIS FAILED",
+                    f"    {r['interaction_error']}",
+                ]
+            )
+        elif r.get("output_file"):
+            lines.append(f"  {name}: analysis not available")
+
+    if interaction_csv:
+        lines.extend(
+            [
+                "",
+                f"  Combined CSV table : {interaction_csv}",
+            ]
+        )
+
+    lines += [
+        "",
         "━━  OUTPUT DIRECTORY",
         f"  {output_dir}",
         f"  {'─' * 60}",
@@ -302,6 +347,8 @@ def generate_summary_report(
         "  redocking/                 fetched native ligand + redock poses",
         "  ligands/                   prepared ligand PDBQT files",
         "  docking/                   docked poses per ligand",
+        "  interactions/              complexes + PLIP XML/TXT/CSV reports",
+        "  interactions/interaction_summary.csv  combined interaction table",
         "  docking_summary.txt        this report",
         "  MDP-log.txt                full pipeline log",
         "",
@@ -465,7 +512,9 @@ def _optimal_rmsd(
     """
     Compute heavy-atom RMSD with Hungarian algorithm matching fallback.
     """
-    n = min(len(coords1), len(coords2))
+    if len(coords1) != len(coords2):
+        return 999.0
+    n = len(coords1)
     if n == 0:
         return 999.0
 
