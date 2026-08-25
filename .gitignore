@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local Codex and Graphify artifacts
+.agents/
+AGENTS.md
+config.json
+graphify-out/
