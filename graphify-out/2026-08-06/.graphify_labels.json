@@ -1,0 +1,20 @@
+{
+  "0": "pipeline.py",
+  "1": "DockingApp",
+  "2": "SettingsDialog",
+  "3": "Graphify",
+  "4": "ligand_prep.py",
+  "5": "receptor_prep.py",
+  "6": "Knowledge Graph",
+  "7": "compress.py",
+  "8": "validate.py",
+  "9": "caveman-compress/README.md",
+  "10": "cavecrew/SKILL.md",
+  "11": "Caveman Help",
+  "12": "Caveman Compress",
+  "13": "caveman/SKILL.md",
+  "14": "caveman-commit",
+  "15": "caveman-review",
+  "16": "caveman-stats",
+  "17": "__init__.py"
+}
