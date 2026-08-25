@@ -1,201 +1,185 @@
 # Advanced Molecular Docking Protocol (AMDP)
 
-An automated, end-to-end virtual screening pipeline that takes a raw receptor structure (**PDB or mmCIF**) and one or more ligand SDF files, identifies the active site deterministically, and runs a fully automated **AutoDock Vina** docking workflow — orchestrated through a clean Tkinter GUI.
+Desktop Tkinter application for reproducible AutoDock Vina screening. It accepts a ligand-bound receptor structure (`.pdb`, `.cif`, or `.mmcif`) and one or more SDF ligands, prepares inputs, validates a reference-ligand redock, ranks production dockings, and writes PLIP interaction and DockLLM analysis files.
 
----
+## What it does
 
-## Overview
+AMDP runs these stages in one timestamped output folder:
 
-AGDP runs a 9-stage pipeline (Stages 0–8):
-
-1. **Stage 0 — Output setup** — a timestamped run directory is created inside your output folder
-2. **Stage 1 — Active-site selection** — HETATM records are parsed from the structure (pure Python) and the co-crystallised ligand is chosen from the list. Selection is deterministic and user-confirmed — **no AI / API key required**
-3. **Stage 2 — Receptor cleaning + grid box** — PyMOL removes solvent, ions and other chains; the native ligand's crystal coordinates are extracted directly from the original structure (pure Python) and used to compute the docking box
-4. **Stage 3 — Receptor PDBQT preparation** — Meeko converts the cleaned receptor to PDBQT
-5. **Stage 4 — Native ligand 3D retrieval & PDBQT** — a clean 3D structure of the native ligand is fetched from RCSB PDB and prepared for redocking
-6. **Stage 5 — Input ligand PDBQT preparation** — Meeko processes each input SDF (2D SDFs are embedded via ETKDGv3 + MMFF94) with explicit hydrogen addition
-7. **Stage 6 — Validation redocking** — the native ligand is re-docked into the pocket; RMSD against the crystal pose is reported
-8. **Stage 7 — Production docking** — all input ligands are docked and ranked by binding affinity
-9. **Stage 8 — Summary report** — a plain-text report is written with all scores, RMSD, and file locations
-
----
-
-## Features
-
-- **PDB and mmCIF input** — receptors can be `.pdb`, `.cif` or `.mmcif` (mmCIF is parsed by a minimal, dependency-free parser; the cleaned receptor is always written as PDB downstream)
-- **Deterministic active-site selection** — HETATM records are read directly from the structure and you pick the ligand; no LLM calls, no API key
-- **Pure-Python native-ligand extraction** — crystal coordinates are read from the original structure for grid centring and RMSD reference
-- **Automatic ligand fetching** — retrieves clean 3D structures from RCSB PDB and PubChem for validation redocking
-- **RMSD validation** — Hungarian-algorithm optimal atom matching (scipy) with a direct fallback; PASS / MARGINAL / FAIL thresholds
-- **Intelligent receptor prep** — preserves essential cofactors (NAD, FAD, HEM, PLP, CoA) while removing solvent, ions, and other chains
-- **Live GUI log** — colour-coded, real-time pipeline output with progress bar (ttkbootstrap themes when installed, graceful plain-Tk fallback)
-- **Configurable docking parameters** — exhaustiveness, number of poses, CPU count, grid padding
-- **Config profiles** — named `config_<name>.json` profiles alongside the default `config.json`
-- **Stop at any stage** — the pipeline can be interrupted cleanly between steps
-
----
+0. Creates run folders and records selected settings.
+1. Parses receptor HETATM records and requires you to choose exact chain and native-ligand instance. No LLM or API key is used for site selection.
+2. Cleans selected receptor chain with PyMOL, optionally preserves essential cofactor, extracts crystal-ligand coordinates, and builds validated Vina grid.
+3. Prepares receptor PDBQT with Meeko.
+4. Fetches native ligand 3D structure from PubChem/RCSB/NIH NCI fallbacks, then prepares it for redocking.
+5. Ensures input SDFs have 3D coordinates (ETKDGv3 + MMFF94 when needed), adds hydrogens, and prepares ligand PDBQT files.
+6. Redocks native ligand and reports RMSD against crystal coordinates when validation preparation succeeds.
+7. Docks supplied ligands with AutoDock Vina and ranks successful results by affinity.
+8. Runs PLIP for validation and production poses, producing per-ligand XML, text, and CSV interaction reports plus combined CSV.
+9. Writes docking summary, complete UI log, DockLLM source manifest, and compact LLM-analysis JSON.
 
 ## Requirements
 
-### Python Packages
+### Python
 
-```
-pip install numpy scipy rdkit ttkbootstrap
-```
-
-(`ttkbootstrap` is optional — the GUI falls back to plain Tk if it isn't installed.)
-
-### External Tools (paths configured via Settings)
-
-| Tool | Purpose |
-|---|---|
-| [AutoDock Vina](https://vina.scripps.edu/) ≥ 1.2 | Molecular docking engine |
-| [PyMOL](https://pymol.org/) | Receptor cleaning |
-| [Meeko](https://github.com/forlilab/Meeko) ≥ 0.5 | PDBQT preparation (`mk_prepare_ligand`, `mk_prepare_receptor`) |
-
----
-
-## Installation
+- Python 3.10+ with Tk support
+- Packages in [`requirements.txt`](requirements.txt): NumPy, SciPy, RDKit, and `ttkbootstrap`
 
 ```bash
-git clone https://github.com/mustafajaved745-source/AI-Guided-Docking-Protocol-AGDP-.git
-cd AI-Guided-Docking-Protocol-AGDP-
-pip install numpy scipy rdkit ttkbootstrap
+python -m pip install -r requirements.txt
 ```
 
-Then launch:
+`ttkbootstrap` provides themed widgets; GUI falls back to standard Tk if unavailable.
+
+### External tools
+
+All tools below are required by settings validation before a run.
+
+| Tool | Used for |
+| --- | --- |
+| [AutoDock Vina](https://vina.scripps.edu/) | Redocking and production docking |
+| [PyMOL](https://pymol.org/) | Receptor cleanup and PLIP complex creation |
+| [Meeko](https://github.com/forlilab/Meeko) | `mk_prepare_ligand` and `mk_prepare_receptor` PDBQT preparation |
+| [PLIP](https://plip-tool.biotec.tu-dresden.de/plip-web/plip/index) | Protein-ligand interaction reports |
+
+Set each executable/script path in app Settings. Paths can point to a binary, a Python script, or a command available on `PATH` where supported.
+
+## Install and launch
 
 ```bash
+git clone https://github.com/mustafajaved745-source/Advanced-Molecular-Docking-Protocol-AMDP-.git
+cd Advanced-Molecular-Docking-Protocol-AMDP-
+python -m pip install -r requirements.txt
 python main.py
 ```
 
-On first launch, open **⚙ Settings** to configure the tool paths.
-
----
+On first launch, open **Settings** and configure Vina, PyMOL, both Meeko commands, PLIP, output directory, and docking parameters. `config.json` is created beside `settings.py`; named profiles are saved as `config_<name>.json`.
 
 ## Configuration
 
-All settings are stored in `config.json` (auto-created with defaults on first run). Configure via the GUI Settings dialog, or edit directly:
-
 ```json
 {
-  "vina_exe":                "/path/to/vina",
-  "pymol_exe":               "/path/to/pymol",
-  "mk_prepare_ligand_cmd":   "/path/to/mk_prepare_ligand.py",
+  "vina_exe": "/path/to/vina",
+  "pymol_exe": "/path/to/pymol",
+  "mk_prepare_ligand_cmd": "/path/to/mk_prepare_ligand.py",
   "mk_prepare_receptor_cmd": "/path/to/mk_prepare_receptor.py",
-  "output_dir":              "/path/to/docking_results",
-  "grid_padding":            4.0,
-  "exhaustiveness":          8,
-  "num_modes":               9,
-  "cpu":                     0
+  "plip_cmd": "/path/to/plip",
+  "output_dir": "/path/to/docking_results",
+  "grid_padding": 4.0,
+  "exhaustiveness": 8,
+  "num_modes": 9,
+  "cpu": 0
 }
 ```
 
-- `grid_padding` — docking-box padding per side in Å (default 4.0; minimum box size enforced at 12 Å per axis)
-- `cpu` — `0` lets Vina auto-detect the core count
-- **Named profiles** — a `config_<name>.json` placed next to `config.json` becomes selectable from the Settings dialog
+- `grid_padding`: clearance around each native-ligand axis in Å; grid enforces at least 12 Å per axis and validates reference-atom clearance.
+- `exhaustiveness`: base Vina search effort. AMDP scales it by grid volume, capped at 64.
+- `num_modes`: maximum Vina poses per ligand.
+- `cpu`: `0` lets Vina choose CPU count.
+- Profiles: create/select `config_<name>.json` from Settings to keep tool paths and docking parameters separate.
 
----
+Do not commit machine-specific `config.json` files with private paths.
 
-## Usage
+## Run docking experiment
 
-1. Launch `python main.py`
-2. Click **⚙ Settings**, set the tool paths, click **Save**
-3. Browse for a **receptor structure** — PDB (`*.pdb`) or mmCIF (`*.cif`, `*.mmcif`) — containing a co-crystallised ligand
-4. Review the detected HETATM ligands and confirm the active-site ligand code
-5. Add one or more **ligand SDF** files
-6. Click **▶ Run Docking Pipeline**
-7. Monitor live progress in the log panel
-8. Click **Open Output Folder** when complete
+1. Start `python main.py`.
+2. Open **Settings**, complete all tool paths, choose output folder, then save.
+3. Choose receptor `.pdb`, `.cif`, or `.mmcif` file.
+4. Select target chain, then select exact co-crystallized ligand instance shown by app.
+5. Add one or more ligand `.sdf` files.
+6. Click **Run Docking Pipeline**. Live log, stage progress, and per-ligand status update while background thread runs.
+7. Review `docking_summary.txt`, redocking RMSD, ranked affinities, PLIP reports, and DockLLM JSON in run folder.
 
----
+You can request clean stop; pipeline stops after current step.
 
-## Output Structure
+## Input rules and behavior
 
-Each run creates a timestamped folder inside your configured output directory:
+- Receptor must contain non-trivial co-crystallized ligand HETATM records. Apo structures and water-only structures cannot define reference grid.
+- AMDP supports PDB and mmCIF receptors. Downstream cleaned receptor is PDB.
+- Chain and ligand instance are user-selected and revalidated before docking. Repeated ligand codes are disambiguated by structural instance.
+- Essential cofactors such as NAD, FAD, HEM, PLP, and CoA can be preserved during receptor cleanup when detected.
+- If native-ligand retrieval/preparation fails, native redocking is skipped; production docking can still proceed.
+- PLIP failures for individual poses are recorded in log/summary without discarding successful docking results.
 
-```
-docking_results/
-└── docking_run_20240115_143022/
-    ├── cleaned_receptor.pdb       # Protein-only structure (single chain)
-    ├── cleaned_receptor.pdbqt     # Meeko-prepared receptor
-    ├── native_ligand.sdf          # Native ligand in SDF format
-    ├── grid_box.txt               # Vina grid configuration
-    ├── redocking/
-    │   ├── <LIG>_online.sdf       # Clean 3D structure from RCSB PDB / PubChem
-    │   ├── <LIG>_3d.sdf           # 3D-embedded native ligand
-    │   ├── <LIG>_native.pdbqt     # Prepared native ligand
-    │   └── native_redock_poses.pdbqt
-    ├── ligands/
-    │   ├── <name>_3d.sdf          # 3D-embedded input ligands
-    │   └── <name>.pdbqt           # Prepared input ligands
-    ├── docking/
-    │   ├── <name>_poses.pdbqt     # Docked poses per ligand
-    │   └── <name>_vina.log        # Vina run logs
-    ├── docking_summary.txt        # Full ranked results report
-    └── MDP-log.txt                # UI / pipeline log
-```
+## Output
 
----
+Each run is saved as `docking_run_YYYYMMDD_HHMMSS` under configured output directory:
 
-## Validation — Redocking RMSD Thresholds
-
-| RMSD | Status | Interpretation |
-|---|---|---|
-| ≤ 2.0 Å | ✅ PASS | Pocket correctly centred; results are reliable |
-| 2.0 – 3.0 Å | ⚠️ MARGINAL | Interpret with caution; check ligand code |
-| > 3.0 Å | ❌ FAIL | Pocket may be mis-centred; verify and rerun |
-
----
-
-## Project Structure
-
-```
-├── main.py           # Tkinter GUI and pipeline orchestration entry point
-├── pipeline.py       # Stage orchestrator — coordinates all modules
-├── hetatm_parser.py  # Dependency-free HETATM parsing (PDB / mmCIF) for active-site selection
-├── mmcif_parser.py   # Minimal mmCIF atom-site parser and PDB/mmCIF detection
-├── receptor_prep.py  # PyMOL receptor cleaning, native-ligand extraction, grid box
-├── ligand_prep.py    # Meeko ligand + receptor PDBQT preparation, 3D embedding
-├── docking.py        # AutoDock Vina execution, redock RMSD, summary report
-├── settings.py       # Settings dialog, config.json + named-profile management
-├── requirements.txt  # Python package dependencies
-└── config.json       # Auto-generated user configuration (not committed)
+```text
+docking_run_YYYYMMDD_HHMMSS/
+├── cleaned_receptor.pdb
+├── cleaned_receptor.pdbqt
+├── grid_box.txt
+├── redocking/
+│   ├── <LIG>_online.sdf
+│   ├── <LIG>_3d.sdf
+│   ├── <LIG>_native.pdbqt
+│   └── native_redock_poses.pdbqt
+├── ligands/
+│   ├── <name>_3d.sdf
+│   └── <name>.pdbqt
+├── docking/
+│   ├── <name>_poses.pdbqt
+│   └── <name>_vina.log
+├── interactions/
+│   ├── <ligand>/                 # PLIP complex, XML, text report, CSV
+│   └── interaction_summary.csv
+├── docking_summary.txt
+├── MDP-log.txt
+├── dockllm-source.json
+└── docking_experiment.llm.json
 ```
 
----
+### Redocking RMSD
 
-## Receptor Requirements
+| RMSD | Status | Meaning |
+| --- | --- | --- |
+| ≤ 2.0 Å | PASS | Reference pose reproduced well |
+| 2.0–3.0 Å | MARGINAL | Check ligand selection and grid before interpreting results |
+| > 3.0 Å | FAIL | Pocket may be mis-centred |
 
-- Standard **PDB** or **mmCIF** file with at least one co-crystallised **non-trivial HETATM** record
-- Waters-only and apo structures are **not supported** — a reference ligand is needed to centre the docking grid
-- Multi-chain structures are handled automatically; the chain containing the selected ligand is isolated
-- If redocking RMSD is poor, check that the correct HETATM ligand was selected in Stage 1
+RMSD compares heavy atoms using optimal matching; atom-count, protonation, or tautomer differences can make it unreliable.
 
----
+## DockLLM export
+
+At pipeline completion AMDP writes `dockllm-source.json` and compact `docking_experiment.llm.json`. From GUI, use **Export LLM JSON** to regenerate analysis file from source manifest.
+
+CLI export:
+
+```bash
+python -m llm_export \
+  --experiment /path/to/dockllm-source.json \
+  --output docking_experiment.llm.json \
+  --detail standard
+```
+
+Use `--detail full|standard|compact`, plus `--pretty`, `--include-coordinates`, or `--include-all-pose-interactions` when needed.
+
+## Project layout
+
+```text
+main.py                  Tkinter UI, file selection, background-run orchestration
+pipeline.py              Stages 0–9, online ligand lookup, output writing
+hetatm_parser.py         PDB/mmCIF HETATM parsing and exact target context
+mmcif_parser.py          Minimal mmCIF atom-site parsing
+receptor_prep.py         PyMOL cleanup, native coordinates, grid calculation
+ligand_prep.py           RDKit 3D preparation and Meeko PDBQT conversion
+docking.py               Vina execution, RMSD, text summary
+interaction_analysis.py  PLIP complex/report/CSV generation
+settings.py              Configuration and profile dialog
+llm_export/              DockLLM JSON builder and CLI
+requirements.txt         Python dependencies
+```
 
 ## Troubleshooting
 
-**"No HETATM records found"** — The receptor structure has no ligand. Use a holo (ligand-bound) structure from the PDB.
-
-**PyMOL fails with unknown option** — AGDP automatically tries `-cq`, `-c`, and no flags in sequence. Ensure PyMOL is callable from the configured path.
-
-**Meeko fails with sanitization error** — The input SDF may have invalid valences. Pre-process with OpenBabel: `obabel input.sdf -O fixed.sdf -h`
-
-**RMSD > 3.0 Å** — The active-site ligand may have been selected incorrectly, or the grid padding is too small. Check the HETATM table in the log and re-run with the correct ligand code.
-
-**mmCIF file rejected** — Ensure the file uses a `.cif` / `.mmcif` extension (detection is by extension with a content sniff fallback).
-
-**Plain (unthemed) GUI** — `ttkbootstrap` isn't installed; AGDP falls back to standard Tk. Install it with `pip install ttkbootstrap` for themed widgets.
-
----
+- **No HETATM records / no active site:** use ligand-bound receptor containing real co-crystallized ligand.
+- **Tool path validation fails:** set Vina, PyMOL, both Meeko commands, and PLIP in Settings; verify file exists or command is on `PATH`.
+- **PyMOL unknown option:** app retries compatible headless flag forms. Confirm configured PyMOL executable runs outside app.
+- **Meeko ligand error:** SDF may have invalid valence/bonds. Repair molecule and retry; inspect UI log.
+- **Redocking skipped or RMSD poor:** confirm exact ligand instance, chain, ligand protonation/tautomer, and grid padding.
+- **PLIP failed:** docking output remains usable; inspect `MDP-log.txt` and interaction error in summary, then confirm PLIP/PyMOL paths.
+- **Plain GUI:** install `ttkbootstrap` in same Python environment used for `python main.py`.
 
 ## License
 
-GNU Affero General Public License v3.0 — see `LICENSE` for details.
-
-## Commercial License
-
-The software in this repository is available under the AGPL v3 license for open-source and academic use.
-
-For commercial use — see `COMMERCIAL` for details.
+GNU Affero General Public License v3.0. See [LICENSE](LICENSE). Commercial use that cannot comply with AGPL requires separate terms; see [COMMERCIAL.md](COMMERCIAL.md).
